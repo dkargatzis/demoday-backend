@@ -1,8 +1,10 @@
 # Secrets are passed at runtime (docker run --env-file .env), never baked into the image.
 .env
+.env.*
 .venv/
 venv/
 storage/
 __pycache__/
 *.pyc
 .git/
+test_e2e.py

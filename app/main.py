@@ -10,12 +10,13 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from app.config import GEMINI_MODEL, GITHUB_API_URL, capabilities, storage_root  # loads .env before anything else
+from app.config import BACKEND_ROOT, GEMINI_MODEL, GITHUB_API_URL, capabilities, storage_root  # loads .env first
 from app import auth, db, vault
 from app.models.schemas import JobStatus, PipelineRequest, _http_url
-from app.services import fixtures
+from app.services import cloud, fixtures
 from app.services.capture import CAPTURES, origin_of
 from app.services.capture import VIEWPORT as CAPTURE_VIEWPORT
 from app.services.netguard import BlockedURL, ensure_public_url
@@ -46,6 +47,7 @@ async def lifespan(_: FastAPI):
         logger.warning("DEMODAY_SECRET_KEY not set: users can't save GitHub tokens or app logins")
     yield
     await CAPTURES.shutdown()
+    db.flush_backup()  # the last writes reach the bucket before the instance goes away
 
 
 app = FastAPI(
@@ -67,6 +69,20 @@ app.include_router(auth.router)
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "service": "demoday-backend", **capabilities()}
+
+
+@app.post("/api/pipeline/share/{job_id}")
+async def share_video(job_id: str, user: Dict = Depends(auth.current_user)):
+    """A link to the finished video that works without signing in (a copy in the public share bucket)."""
+    job = _job_for(job_id, user)
+    video_path = storage_root() / job_id / "demo.mp4"
+    if not job.video_url or not video_path.is_file():
+        raise HTTPException(404, "Video file not found")
+    try:
+        url = await cloud.share_video_url(job_id, video_path)
+    except cloud.CloudUnavailable as exc:
+        raise HTTPException(503, str(exc))
+    return {"url": url, "expires_at": None}
 
 
 # --------------------------------------------------------------------------- pipeline
@@ -234,7 +250,10 @@ async def capture_socket(websocket: WebSocket, capture_id: str):
     """Live view of the sign-in browser: JPEG frames and status out, clicks/typing/scrolling in."""
     user = auth.user_from_token(websocket.cookies.get(auth.COOKIE))
     session = CAPTURES.get(capture_id, user["id"]) if user else None
-    if websocket.headers.get("origin") not in ORIGINS or session is None:
+    origin = websocket.headers.get("origin", "")
+    # Same-origin (the dashboard served by this service) or a listed dashboard origin; anything else is refused.
+    same_origin = origin and origin.split("://", 1)[-1] == websocket.headers.get("host", "")
+    if not (same_origin or origin in ORIGINS) or session is None:
         await websocket.close(code=4403)
         return
     await websocket.accept()
@@ -370,3 +389,17 @@ async def delete_fixture(set_id: str, user: Dict = Depends(auth.current_user)):
     if not fixtures.delete_set(user["id"], set_id):
         raise HTTPException(404, "Sample data set not found")
     return {"ok": True}
+
+
+# --------------------------------------------------------------------------- static frontend (production)
+
+# In production the Next.js static export (next build with NEXT_OUTPUT=export) is served from the same origin as
+# the API, so cookies, the event stream and the sign-in WebSocket never cross sites. Registered last: API routes win.
+_static_dir = os.getenv("STATIC_DIR", str(BACKEND_ROOT / "static"))
+if os.path.isdir(_static_dir) and os.path.isfile(os.path.join(_static_dir, "index.html")):
+    @app.api_route("/api/{_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"], include_in_schema=False)
+    async def api_not_found(_path: str):  # unknown API paths stay JSON 404s instead of the site's 404 page
+        raise HTTPException(status_code=404, detail="Not found")
+
+    app.mount("/", StaticFiles(directory=_static_dir, html=True), name="frontend")
+    logger.info("serving the dashboard from %s", _static_dir)

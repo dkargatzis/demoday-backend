@@ -285,9 +285,12 @@ def _short(exc: BaseException) -> str:
     return (text.splitlines()[0] if text else type(exc).__name__)[:160]
 
 
+CHROMIUM_ARGS = ["--disable-dev-shm-usage", "--disable-gpu", "--no-first-run"]  # safe in containers (Cloud Run)
+
+
 async def launch_chromium(pw: Playwright) -> Browser:
     try:
-        return await pw.chromium.launch(headless=True)
+        return await pw.chromium.launch(headless=True, chromium_sandbox=False, args=CHROMIUM_ARGS)
     except PlaywrightError as exc:
         raise RuntimeError(
             "Could not launch headless Chromium. Run `python -m playwright install chromium` inside the "

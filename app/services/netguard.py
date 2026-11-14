@@ -15,7 +15,7 @@ import time
 from typing import Dict, Optional, Tuple
 from urllib.parse import urlparse
 
-from playwright.async_api import BrowserContext, Route
+from playwright.async_api import BrowserContext, Route, WebSocketRoute
 
 from app.config import env_flag
 
@@ -72,15 +72,23 @@ async def ensure_public_url(url: str) -> None:
 
 
 async def guard_context(context: BrowserContext) -> None:
-    """Aborts every request (navigations, redirects, subresources) that leaves the public internet."""
+    """Aborts every request (navigations, redirects, subresources, WebSockets) that leaves the public internet."""
     if env_flag("ALLOW_PRIVATE_URLS"):
         return
 
     async def check(route: Route) -> None:
         parsed = urlparse(route.request.url)
-        if parsed.scheme in ("http", "https", "ws", "wss") and await host_problem(parsed.hostname or ""):
+        if parsed.scheme in ("http", "https") and await host_problem(parsed.hostname or ""):
             await route.abort("blockedbyclient")
         else:
             await route.continue_()
 
+    async def check_websocket(ws: WebSocketRoute) -> None:
+        # route() never sees WebSockets; without a server connection the socket simply never opens.
+        if await host_problem(urlparse(ws.url).hostname or ""):
+            await ws.close(code=1008, reason="blocked")
+            return
+        ws.connect_to_server()
+
     await context.route("**/*", check)
+    await context.route_web_socket("**/*", check_websocket)

@@ -126,6 +126,30 @@ Runs a full job in-process and checks the output: H.264/yuv420p 1920x1080, AAC 4
 
 ---
 
+## Google Cloud Run (live deployment)
+
+`../deploy.sh` deploys DemoDay as **one Cloud Run service**: this API plus the dashboard's static build, served from
+the same origin (so the session cookie, the event stream and the sign-in WebSocket never cross sites; `*.run.app`
+is a public suffix, so two separate services would). It creates, idempotently:
+
+- a service account with access only to the secrets and the bucket;
+- Secret Manager secrets `demoday-gemini-api-key`, `demoday-fal-key`, `demoday-secret-key` (generated once),
+  `demoday-signup-code` (generated; required to create accounts) and optionally `demoday-github-token`,
+  seeded from `demoday-backend/.env`;
+- a Cloud Storage bucket mounted at `/mnt/storage` for videos and job files, with the SQLite database kept on
+  local disk and snapshotted to the bucket after every write (restored on start);
+- the Cloud Run service (gen2, 4 vCPU / 8 GiB, one always-on instance, no CPU throttling, 60-minute requests),
+  built by Cloud Build from this Dockerfile, with Google Cloud Text-to-Speech (Chirp 3 HD) enabled as the
+  narration fallback.
+
+```bash
+./deploy.sh                      # setup + build + deploy; prints the URL and how to read the signup code
+./deploy.sh --enable-share-links # optional: a public bucket so "Copy Link" gives links anyone can open
+```
+
+One instance keeps jobs, the recording slot and sign-in captures in memory; a deploy restarts it, so finish
+running demos first. Finished demos reload from the bucket.
+
 ## Docker Deployment
 
 Build and run in a self-contained container with all OS dependencies and Chromium pre-installed. Secrets are passed at runtime and are excluded from the image by `.dockerignore`:

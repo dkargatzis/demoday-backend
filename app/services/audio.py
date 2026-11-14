@@ -15,6 +15,7 @@ from typing import Optional, Tuple
 import httpx
 
 from app.config import get_secret
+from app.services import cloud
 from app.services.stitcher import AUDIO_RATE, probe_duration, run_ffmpeg
 
 logger = logging.getLogger("demoday.audio")
@@ -51,6 +52,13 @@ async def synthesize_scene_audio(text: str, output_path, voice_style: str = "ene
             except Exception as exc:
                 logger.warning("fal.ai TTS failed: %s", exc)
                 engine = f"fal.ai unavailable ({_short(exc)}) → "
+        if raw is None and cloud.google_tts_enabled():  # Google Cloud Chirp 3 HD (no key: runtime credentials)
+            try:
+                raw = await cloud.google_tts(text, tmp_dir / "google.wav", voice_style)
+                engine += f"Google Cloud TTS ({cloud.GOOGLE_VOICES.get(voice_style, cloud.GOOGLE_VOICES['energetic_tech'])[0]})"
+            except Exception as exc:
+                logger.warning("Google TTS failed: %s", exc)
+                engine += f"Google TTS unavailable ({_short(exc)}) → "
         if raw is None:
             raw = await _local_tts(text, tmp_dir, wpm)
             if raw is not None:

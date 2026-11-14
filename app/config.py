@@ -59,6 +59,15 @@ def storage_root() -> Path:
     return root
 
 
+def work_root() -> Path:
+    """Scratch space for a job's intermediates (recordings, clips, narration). Defaults to the storage root;
+    on Cloud Run WORK_DIR points to local disk so only the finished demo.mp4 and job.json reach the bucket."""
+    configured = os.getenv("WORK_DIR", "").strip()
+    root = Path(configured) if configured else storage_root()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
 def capabilities() -> dict:
     from app import vault  # imported here to avoid a config <-> vault import cycle
 

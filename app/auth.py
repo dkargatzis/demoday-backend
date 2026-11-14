@@ -25,7 +25,7 @@ COOKIE = "demoday_session"
 SESSION_TTL_SEC = 14 * 24 * 3600
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 14, 8, 1
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-ATTEMPT_WINDOW_SEC, MAX_ATTEMPTS = 600, 20
+ATTEMPT_WINDOW_SEC, MAX_ATTEMPTS = 600, 40
 _attempts: Dict[str, Deque[float]] = defaultdict(deque)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -61,8 +61,17 @@ def _token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+def _client_key(request: Request) -> str:
+    """The caller's address. Behind Cloud Run's proxy request.client is the proxy; the proxy appends the real
+    client to X-Forwarded-For, so the LAST entry is the trustworthy one (a client can't spoof it)."""
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[-1].strip() or "unknown"
+    return request.client.host if request.client else "unknown"
+
+
 def _rate_limit(request: Request) -> None:
-    key = request.client.host if request.client else "unknown"
+    key = _client_key(request)
     now, window = time.monotonic(), _attempts[key]
     while window and now - window[0] > ATTEMPT_WINDOW_SEC:
         window.popleft()

@@ -14,3 +14,6 @@ __pycache__/
 
 # OS noise
 .DS_Store
+
+# dashboard static export copied in by deploy.sh
+static/

@@ -2,13 +2,14 @@
 import asyncio
 import json
 import logging
+import shutil
 import time
 import uuid
 from pathlib import Path
 from typing import AsyncGenerator, Callable, Dict, Optional, Set, Tuple
 
 from app import db, vault
-from app.config import get_secret, storage_root
+from app.config import get_secret, storage_root, work_root
 from app.models.schemas import JobStatus, PipelineRequest
 from app.services.audio import synthesize_scene_audio
 from app.services.bookends import FAL_VIDEO_MODEL, prepare_bookends
@@ -69,7 +70,7 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
     started = time.monotonic()
 
     try:  # everything, including setup, must land in a terminal state or the job hangs in "running"
-        job_dir = storage_root() / job_id
+        job_dir = work_root() / job_id  # intermediates; the results are copied to storage_root()/job_id
         job_dir.mkdir(parents=True, exist_ok=True)
         try:
             await ensure_public_url(req.app_url)
@@ -207,6 +208,7 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
             await concat_scenes(clips, final_path)
 
         media = await describe_media(final_path)
+        final_path = _publish(job_dir, job_id, final_path)  # demo.mp4 into storage; scratch removed
         storyboard.total_duration_sec = round(media["duration"], 2)
         log(f"demo.mp4 ready: {media['duration']:.1f}s, {media['width']}x{media['height']} "
             f"{media['video_codec']}/{media['audio_codec']}, {media['size_bytes'] / 1e6:.1f} MB")
@@ -234,9 +236,32 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
 
     if job_dir is not None:  # storyboard, launch kit and logs next to the media, for debugging and re-download
         try:
-            (job_dir / "job.json").write_text(job.model_dump_json(indent=2))
+            result_dir = storage_root() / job_id
+            result_dir.mkdir(parents=True, exist_ok=True)
+            (result_dir / "job.json").write_text(job.model_dump_json(indent=2))
         except OSError as exc:
             logger.warning("[%s] could not write job.json: %s", job_id, exc)
+        if job.status == "failed":
+            shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def _publish(job_dir: Path, job_id: str, final_path: Path) -> Path:
+    """Moves demo.mp4 from the scratch dir into storage and deletes every intermediate."""
+    result_dir = storage_root() / job_id
+    result_dir.mkdir(parents=True, exist_ok=True)
+    target = result_dir / "demo.mp4"
+    if final_path.resolve() != target.resolve():
+        shutil.copyfile(final_path, target)
+    for path in job_dir.iterdir():
+        if job_dir == result_dir and path.name in ("demo.mp4", "job.json"):
+            continue
+        try:
+            shutil.rmtree(path, ignore_errors=True) if path.is_dir() else path.unlink()
+        except OSError as exc:
+            logger.warning("could not remove %s: %s", path, exc)
+    if job_dir != result_dir:
+        shutil.rmtree(job_dir, ignore_errors=True)
+    return target
 
 
 def create_pipeline_job(req: PipelineRequest, user_id: Optional[str] = None) -> JobStatus:

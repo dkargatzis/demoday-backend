@@ -1,0 +1,11 @@
+# Cloud Build upload context (gcloud run deploy --source)
+.git/
+.venv/
+venv/
+storage/
+__pycache__/
+*.pyc
+.env
+.env.*
+test_e2e.py
+README.md
