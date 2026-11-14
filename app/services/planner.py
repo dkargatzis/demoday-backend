@@ -1,141 +1,369 @@
-import os
+"""Gemini planning: the scene-by-scene storyboard and the launch collateral, with template fallbacks."""
+import asyncio
 import json
+import logging
+import re
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+
 from google import genai
 from google.genai import types
-from app.models.schemas import Storyboard, LaunchKit, Scene, Action
 
-def get_gemini_client():
-    api_key = os.getenv("GEMINI_API_KEY", "")
-    if not api_key:
-        return None
-    return genai.Client(api_key=api_key)
+from app.config import GEMINI_MODEL, get_secret
+from app.models.schemas import Action, LaunchKit, Scene, Storyboard
 
-async def generate_storyboard(repo_info: dict, app_info: dict, target_seconds: int = 60) -> Storyboard:
-    """Uses Gemini to plan an exact scene-by-scene demo storyboard."""
-    client = get_gemini_client()
-    project_name = repo_info.get("name") or app_info.get("title") or "GenAI Project"
+logger = logging.getLogger("demoday.planner")
 
-    prompt = f"""You are the Demo Day Director. Produce a tight {target_seconds}-second video storyboard for a hackathon pitch demo.
-Project Name: {project_name}
-Repo Details: {repo_info.get('description', '')}
-Dependencies: {', '.join(repo_info.get('dependencies', []))}
-Live URL Title: {app_info.get('title', '')}
-README Excerpt: {repo_info.get('readme', '')[:2000]}
+GEMINI_TIMEOUT_SEC = 90
+# Spoken words per second per voice preset (audio.VOICE_PRESETS), measured on real Gemini narration read by
+# fal.ai Kokoro: sentence breaks and product names make it slower than plain prose. Erring low keeps videos
+# at or under the requested length.
+WORDS_PER_SECOND = {"energetic_tech": 2.0, "calm_expert": 1.7, "fast_founder": 2.1}
+TAIL_ALLOWANCE_SEC = 2.0  # ~5 scenes x 0.4 s of breathing room added after each narration line
+ALLOWED_ACTIONS = {"navigate", "click", "type", "scroll", "wait"}
+TONES = {
+    "energetic_tech": "high-energy tech founder: upbeat, confident, crisp",
+    "calm_expert": "calm technical expert: clear, measured, authoritative",
+    "fast_founder": "rapid-fire hackathon pitch: short sentences, bold claims backed by real features",
+}
 
-Rules:
-1. Divide demo into exactly 4-5 focused scenes (Hook, Problem/Input, AI Action, Magic Result/Export).
-2. Each scene narration must be concise, punchy, conversational spoken English.
-3. Actions must specify real Playwright browser steps (navigate, click, type, scroll, wait).
-4. Output strictly valid JSON conforming to this schema:
-{{
-  "project_name": "{project_name}",
-  "tagline": "A one-line punchy slogan",
-  "scenes": [
-    {{
-      "id": "scene-1",
-      "title": "Opening Hook",
-      "route": "/",
-      "narration": "What the voiceover says during this scene.",
-      "actions": [
-        {{"type": "navigate", "value": "/"}},
-        {{"type": "wait", "dwell_ms": 1500}}
-      ]
-    }}
-  ]
-}}
-"""
-    if client:
-        try:
-            response = client.models.generate_content(
-                model="gemini-2.0-flash",
+
+# --------------------------------------------------------------------------- Gemini plumbing
+
+
+async def _generate_json(prompt: str) -> Any:
+    key = get_secret("GEMINI_API_KEY")
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY not configured")
+    client = genai.Client(api_key=key, http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_SEC * 1000))
+    try:
+        response = await asyncio.wait_for(
+            client.aio.models.generate_content(
+                model=GEMINI_MODEL,
                 contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.3
-                )
-            )
-            data = json.loads(response.text)
-            return Storyboard(**data)
-        except Exception as e:
-            print(f"Gemini fallback error: {e}")
+                config=types.GenerateContentConfig(response_mime_type="application/json"),
+            ),
+            timeout=GEMINI_TIMEOUT_SEC + 10,
+        )
+    finally:
+        await client.aio.aclose()
+    text = (response.text or "").strip()
+    if not text:
+        raise ValueError("Gemini returned an empty response")
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)  # tolerate fenced output
+    return json.loads(text)
 
-    # Fallback deterministic template when API key is unset
+
+def _failure_reason(exc: Exception) -> str:
+    message = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+    return message[:160]
+
+
+# --------------------------------------------------------------------------- shared context
+
+
+def project_name(repo_info: dict, app_info: dict) -> str:
+    """Repo name, re-cased from the app title when they match (fastapi + "FastAPI" -> FastAPI)."""
+    name = repo_info.get("name") or ""
+    title = app_info.get("title") or ""
+    if name:
+        match = re.search(re.escape(name.replace("-", " ")), title.replace("-", " "), re.IGNORECASE)
+        return title[match.start():match.end()] if match else name
+    return title.split("|")[0].split(" - ")[0].strip() or "This project"
+
+
+def _summary(repo_info: dict, app_info: dict) -> str:
+    text = (repo_info.get("description") or app_info.get("description") or "").strip()
+    if not text:
+        return ""
+    first = re.split(r"(?<=[.!?])\s", text, maxsplit=1)[0].strip()
+    return first if first.endswith((".", "!", "?")) else first + "."
+
+
+def _pick_nav_link(links: List[dict]) -> Optional[dict]:
+    """A primary-navigation link worth clicking on camera (skips home links and language switchers)."""
+    def usable(link: dict) -> bool:
+        path = link["path"].split("?")[0]
+        return (path not in ("/", "") and 3 <= len(link["text"]) <= 30
+                and not re.fullmatch(r"/[a-z]{2}(?:[-_][a-z]{2,4})?/?", path, re.IGNORECASE))
+    candidates = [link for link in links if usable(link)]
+    return next((link for link in candidates if link.get("nav")), candidates[0] if candidates else None)
+
+
+def _readme_features(readme: str, limit: int = 5) -> List[str]:
+    """The first bullet list after a line mentioning features (or the first bullet list at all)."""
+    lines = readme.splitlines()
+    start = next((i + 1 for i, line in enumerate(lines) if re.search(r"feature", line, re.IGNORECASE)), 0)
+    bullets: List[str] = []
+    for line in lines[start:]:
+        bullet = re.match(r"^\s*[-*+]\s+(.*)", line)
+        if bullet:
+            text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", bullet.group(1))
+            text = re.sub(r"[*_`]", "", text).strip()
+            if 10 <= len(text) <= 220:
+                bullets.append(text)
+            if len(bullets) >= limit:
+                break
+        elif bullets and line.strip() and not line.startswith((" ", "\t")):
+            break  # first list ended
+    return bullets
+
+
+def _clean_narration(text: Any) -> str:
+    # TTS spells full URLs out character by character; say just the domain instead.
+    text = re.sub(r"https?://(?:www\.)?([^/\s]+)\S*", r"\1", str(text or ""))
+    text = re.sub(r"[*_#`>|]", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _inventory_lines(app_info: dict) -> str:
+    lines = []
+    for link in app_info.get("links", [])[:25]:
+        lines.append(f'- link "{link["text"]}" -> path {link["path"]} | selector: {link["selector"]}')
+    for button in app_info.get("buttons", [])[:12]:
+        lines.append(f'- button "{button["text"]}" | selector: {button["selector"]}')
+    for field in app_info.get("inputs", [])[:8]:
+        lines.append(f'- input "{field["label"]}" | selector: {field["selector"]}')
+    return "\n".join(lines) or "- (no interactive elements detected; use scroll and wait)"
+
+
+# --------------------------------------------------------------------------- storyboard
+
+
+async def generate_storyboard(
+    repo_info: dict, app_info: dict, target_seconds: int = 60, voice_style: str = "energetic_tech",
+    repo_url: str = "",
+) -> Tuple[Storyboard, str]:
+    """Returns (storyboard, human-readable note on which planner produced it)."""
+    name = project_name(repo_info, app_info)
+    total_words = int((target_seconds - TAIL_ALLOWANCE_SEC) * WORDS_PER_SECOND.get(voice_style, 2.4))
+    prompt = f"""You are directing a {target_seconds}-second product demo video for a hackathon submission.
+A headless browser (1920x1080) performs your actions on the LIVE app while a voiceover reads your narration.
+
+PROJECT
+- Name: {name}
+- Repository: {repo_url} - {repo_info.get('description', '')}
+- Language: {repo_info.get('language', '')}; dependencies: {', '.join(repo_info.get('dependencies', [])[:20])}
+- Live app: {app_info.get('url', '')} - title "{app_info.get('title', '')}"; description: "{app_info.get('description', '')}"
+- Headings on the landing page: {' | '.join(app_info.get('headings', [])[:8])}
+- Page routes found in the repository: {', '.join(repo_info.get('routes', [])) or 'none detected'}
+
+README EXCERPT
+<<<
+{repo_info.get('readme', '')[:3500]}
+>>>
+
+INTERACTIVE ELEMENTS ON THE LIVE LANDING PAGE (selectors are verified, use them verbatim)
+{_inventory_lines(app_info)}
+
+RULES
+1. Write 4-5 scenes: hook, the problem or input, the core feature in action, the payoff, a closing call to action.
+2. Narration is spoken aloud: plain conversational English, no emojis, markdown, URLs or code.
+   About {total_words} words in total (roughly {total_words // 5} per scene). Tone: {TONES.get(voice_style, TONES['energetic_tech'])}.
+3. "route" is the path where a scene starts ("/" for the landing page). Use only "/", paths from the list above, or
+   repository routes. The browser keeps its state between scenes, so a scene can continue where the last one ended.
+4. Actions (each may set "dwell_ms", the pause after it, 500-4000):
+   {{"type": "navigate", "value": "/path"}}
+   {{"type": "click", "selector": "<selector from the list>"}}
+   {{"type": "type", "selector": "<input selector>", "value": "text to type"}}  (end value with \\n to press Enter)
+   {{"type": "scroll", "value": "down" | "up" | "top" | "bottom"}}
+   {{"type": "wait"}}
+   Only use selectors from the list. When unsure, scroll or wait instead of guessing.
+   Keep each scene's total dwell close to its narration time (about 400 ms per word): the scene ends when its
+   narration ends, and later actions are skipped.
+5. Respond with JSON only:
+{{"project_name": "{name}", "tagline": "one punchy line", "scenes": [{{"id": "scene-1", "title": "...", "route": "/",
+  "narration": "...", "actions": [{{"type": "scroll", "value": "down", "dwell_ms": 1500}}]}}]}}
+"""
+    if get_secret("GEMINI_API_KEY"):
+        try:
+            storyboard = _sanitize_storyboard(await _generate_json(prompt), name)
+            return storyboard, f"Storyboard planned by Gemini ({GEMINI_MODEL})"
+        except Exception as exc:
+            logger.warning("Gemini storyboard failed: %s", exc)
+            reason = f"Gemini ({GEMINI_MODEL}) failed: {_failure_reason(exc)}"
+    else:
+        reason = "GEMINI_API_KEY not set"
+    return _template_storyboard(repo_info, app_info), f"{reason}: template storyboard fallback"
+
+
+def _sanitize_storyboard(data: Any, fallback_name: str) -> Storyboard:
+    if isinstance(data, list):
+        data = {"scenes": data}
+    if not isinstance(data, dict):
+        raise ValueError("storyboard is not a JSON object")
+    if "scenes" not in data:  # unwrap {"storyboard": {...}}
+        data = next((v for v in data.values() if isinstance(v, dict) and "scenes" in v), data)
+    scenes: List[Scene] = []
+    for raw in data.get("scenes") or []:
+        if not isinstance(raw, dict):
+            continue
+        narration = _clean_narration(raw.get("narration"))
+        if not narration:
+            continue
+        actions = [a for a in (_sanitize_action(x) for x in raw.get("actions") or []) if a]
+        route = str(raw.get("route") or "/").strip() or "/"
+        scenes.append(Scene(
+            id=f"scene-{len(scenes) + 1}",
+            title=str(raw.get("title") or f"Scene {len(scenes) + 1}")[:80],
+            route=route,
+            narration=narration[:600],
+            actions=actions[:8],
+        ))
+    if not scenes:
+        raise ValueError("storyboard contained no usable scenes")
     return Storyboard(
-        project_name=project_name,
-        tagline="Autonomous AI Launch Kit Generator",
-        scenes=[
-            Scene(
-                id="scene-1",
-                title="Hero Entry",
-                route="/",
-                narration=f"Meet {project_name}, built to streamline hackathon launches into a single automated pipeline.",
-                actions=[Action(type="navigate", value="/"), Action(type="wait", dwell_ms=1800)]
-            ),
-            Scene(
-                id="scene-2",
-                title="Autonomous Input",
-                route="/",
-                narration="Provide any GitHub repository and deployed URL. The agent scans the route tree, dependencies, and live UI.",
-                actions=[
-                    Action(type="scroll", value="down", dwell_ms=1500),
-                    Action(type="wait", dwell_ms=2000)
-                ]
-            ),
-            Scene(
-                id="scene-3",
-                title="AI Orchestration",
-                route="/",
-                narration="Under the hood, Gemini drafts the narrative, fal synthesizes voiceovers, and Playwright records crisp 1080p browser footage.",
-                actions=[Action(type="wait", dwell_ms=3000)]
-            ),
-            Scene(
-                id="scene-4",
-                title="Finished Deliverable",
-                route="/",
-                narration="In under 60 seconds, you get a stitched video demo, README documentation, and a complete social launch kit.",
-                actions=[Action(type="scroll", value="top", dwell_ms=1500)]
-            )
-        ]
+        project_name=str(data.get("project_name") or fallback_name)[:80],
+        tagline=_clean_narration(data.get("tagline"))[:140],
+        scenes=scenes[:6],
     )
 
-async def generate_launch_kit(storyboard: Storyboard, repo_info: dict) -> LaunchKit:
-    """Generates README, Devpost pitch, X thread, and LinkedIn announcement."""
-    client = get_gemini_client()
-    name = storyboard.project_name
-    tagline = storyboard.tagline
 
-    prompt = f"""Generate a complete Launch Kit for {name}: {tagline}.
-Based on these demo scenes: {json.dumps([s.model_dump() for s in storyboard.scenes])}
-Return strictly JSON:
-{{
-  "readme_markdown": "# Markdown with badges, features, and quickstart",
-  "devpost_pitch": "### Inspiration\n### What it does\n### How we built it\n### Challenges\n### Accomplishments",
-  "x_thread": ["Tweet 1 hook with link", "Tweet 2 technical architecture", "Tweet 3 demo callout"],
-  "linkedin_post": "Engaging professional founder announcement with emojis and bullet points"
-}}
+def _sanitize_action(raw: Any) -> Optional[Action]:
+    if not isinstance(raw, dict):
+        return None
+    kind = str(raw.get("type", "")).strip().lower()
+    if kind not in ALLOWED_ACTIONS:
+        return None
+    selector = str(raw["selector"]).strip() if raw.get("selector") not in (None, "") else None
+    value = str(raw["value"]) if raw.get("value") not in (None, "") else None
+    if (kind == "click" and not selector) or (kind == "type" and not (selector and value)) \
+            or (kind == "navigate" and not value):
+        return None
+    try:
+        dwell = int(float(raw.get("dwell_ms", 1500)))
+    except (TypeError, ValueError):
+        dwell = 1500
+    return Action(type=kind, selector=selector, value=value, dwell_ms=max(0, min(dwell, 8000)))
+
+
+def _template_storyboard(repo_info: dict, app_info: dict) -> Storyboard:
+    """Deterministic, project-specific storyboard used when Gemini is unavailable."""
+    name = project_name(repo_info, app_info)
+    summary = _summary(repo_info, app_info)
+    nav = _pick_nav_link(app_info.get("links", []))
+    scenes = [
+        Scene(id="scene-1", title="Hook", route="/",
+              narration=f"Meet {name}. {summary}".strip(),
+              actions=[Action(type="wait", dwell_ms=1200), Action(type="scroll", value="down", dwell_ms=1500)]),
+        Scene(id="scene-2", title="A closer look", route="/",
+              narration="Here is the live app, running in production right now. Let's scroll through what it offers.",
+              actions=[Action(type="scroll", value="down", dwell_ms=1800),
+                       Action(type="scroll", value="down", dwell_ms=1800)]),
+    ]
+    if nav:
+        scenes.append(Scene(id="scene-3", title=nav["text"], route="/",
+                            narration=f"Let's jump into {nav['text']} and see how it works.",
+                            actions=[Action(type="scroll", value="top", dwell_ms=900),
+                                     Action(type="click", selector=nav["selector"], dwell_ms=2200),
+                                     Action(type="scroll", value="down", dwell_ms=1500)]))
+    scenes.append(Scene(id=f"scene-{len(scenes) + 1}", title="Call to action", route="/",
+                        narration=f"That's {name}. Check out the repository, give it a star, and try it yourself.",
+                        actions=[Action(type="wait", dwell_ms=1500)]))
+    tagline = summary.rstrip(".") if summary else f"{name}, live and ready to try"
+    return Storyboard(project_name=name, tagline=tagline[:140], scenes=scenes)
+
+
+# --------------------------------------------------------------------------- launch kit
+
+
+async def generate_launch_kit(
+    storyboard: Storyboard, repo_info: dict, app_info: dict, repo_url: str, app_url: str,
+) -> Tuple[LaunchKit, str]:
+    """Returns (launch kit, human-readable note on which generator produced it)."""
+    name, tagline = storyboard.project_name, storyboard.tagline
+    narration = "\n".join(f"{i + 1}. {s.title}: {s.narration}" for i, s in enumerate(storyboard.scenes))
+    prompt = f"""Write launch collateral for a hackathon project. Be specific to THIS project and use only facts from
+the context below; never invent metrics, users, or features.
+
+PROJECT: {name} - {tagline}
+Repository: {repo_url}
+Live demo: {app_url}
+Description: {repo_info.get('description', '') or app_info.get('description', '')}
+Language: {repo_info.get('language', '')}; dependencies: {', '.join(repo_info.get('dependencies', [])[:20])}
+README excerpt:
+<<<
+{repo_info.get('readme', '')[:3000]}
+>>>
+Demo video narration:
+{narration}
+
+Return JSON with exactly these keys:
+- "readme_markdown": a polished GitHub README in Markdown: title and tagline, links to the live demo and repo,
+  features, how it works, tech stack, and a quickstart using only commands evident from the context.
+- "devpost_pitch": Markdown with the sections "## Inspiration", "## What it does", "## How we built it",
+  "## Challenges we ran into", "## Accomplishments that we're proud of", "## What we learned", "## What's next".
+- "x_thread": an array of 4-6 tweets, each under 270 characters; the first is the hook; include the live demo and
+  repo links where natural; at most two hashtags in total.
+- "linkedin_post": a professional announcement of 120-200 words in short paragraphs.
 """
-    if client:
+    if get_secret("GEMINI_API_KEY"):
         try:
-            response = client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.4
-                )
-            )
-            data = json.loads(response.text)
-            return LaunchKit(**data)
-        except Exception as e:
-            print(f"Gemini launch kit fallback error: {e}")
+            return _sanitize_launch_kit(await _generate_json(prompt)), f"Launch kit written by Gemini ({GEMINI_MODEL})"
+        except Exception as exc:
+            logger.warning("Gemini launch kit failed: %s", exc)
+            reason = f"Gemini ({GEMINI_MODEL}) failed: {_failure_reason(exc)}"
+    else:
+        reason = "GEMINI_API_KEY not set"
+    kit = _template_launch_kit(storyboard, repo_info, app_info, repo_url, app_url)
+    return kit, f"{reason}: template launch kit fallback"
 
-    return LaunchKit(
-        readme_markdown=f"""# {name} 🚀\n\n> {tagline}\n\n## Overview\n{name} autonomously navigates your web application, captures synchronized video footage, generates voiceovers, and prepares complete launch documentation.\n\n## Architecture\n- **Backend**: FastAPI, Pydantic AI, Playwright, FFmpeg\n- **Voice & Media**: fal.ai credits & Gemini 2.0\n- **Frontend**: Next.js App Router\n\n## Getting Started\n```bash\ngit clone <repo>\ncd demoday-backend && uvicorn app.main:app --reload\n```""",
-        devpost_pitch=f"""### Inspiration\nHackathon teams spend 48 hours building groundbreaking tech, then scramble in the last 15 minutes to record buggy screen captures and hasty pitch decks. {name} turns that painful final hour into a 45-second automated task.\n\n### What it does\nGiven a repository and deployed URL, it extracts product context, drafts a storyboard, drives headless Playwright to record interactions, records fal.ai voiceovers, and muxes an MP4 demo.\n\n### How we built it\nFastAPI worker with headless Chromium and FFmpeg in Docker, Gemini 2.0 Flash for structured planning, and fal.ai for low-latency voice synthesis.""",
-        x_thread=[
-            f"1/ Excited to launch {name}: {tagline}! 🎥\n\nStop wasting your final hackathon hour recording broken demos. Point {name} at your repo and get a complete launch kit in 60s.",
-            "2/ Powered by Pydantic AI, Gemini 2.0 for scene planning, Playwright for deterministic headless browser capture, and fal.ai for frame-accurate voiceovers.",
-            "3/ Check out the live demo and full open-source repo: [link]"
-        ],
-        linkedin_post=f"We're thrilled to introduce {name}: {tagline}! 🎉\n\nEvery founder and hackathon participant knows the dread of recording last-minute demo videos. {name} automates the entire loop: browser interaction, voice synthesis, video muxing, and documentation generation.\n\nBuilt with FastAPI, Playwright, fal.ai, and Next.js."
+
+def _sanitize_launch_kit(data: Any) -> LaunchKit:
+    if not isinstance(data, dict):
+        raise ValueError("launch kit is not a JSON object")
+    thread = data.get("x_thread") or []
+    if isinstance(thread, str):
+        thread = [t.strip() for t in re.split(r"\n\s*\n", thread) if t.strip()]
+    thread = [str(t).strip()[:280] for t in thread if str(t).strip()]
+    kit = LaunchKit(
+        readme_markdown=str(data.get("readme_markdown") or "").strip(),
+        devpost_pitch=str(data.get("devpost_pitch") or "").strip(),
+        x_thread=thread,
+        linkedin_post=str(data.get("linkedin_post") or "").strip(),
     )
+    if not (kit.readme_markdown and kit.devpost_pitch and kit.x_thread and kit.linkedin_post):
+        raise ValueError("launch kit is missing fields")
+    return kit
+
+
+def _template_launch_kit(storyboard: Storyboard, repo_info: dict, app_info: dict,
+                         repo_url: str, app_url: str) -> LaunchKit:
+    name, tagline = storyboard.project_name, storyboard.tagline
+    description = (repo_info.get("description") or app_info.get("description") or tagline).strip()
+    deps = repo_info.get("dependencies", [])[:10]
+    stack = ", ".join(([repo_info["language"]] if repo_info.get("language") else []) + deps) or "see the repository"
+    highlights = _readme_features(repo_info.get("readme", "")) \
+        or [h for h in app_info.get("headings", []) if 3 <= len(h) <= 80][:5]
+    features = "\n".join(f"- {h}" for h in highlights) or f"- {description}"
+    host = urlparse(app_url).netloc or app_url
+    readme = (
+        f"# {name}\n\n> {tagline}\n\n"
+        f"**Live demo:** {app_url}  \n**Source:** {repo_url}\n\n"
+        f"## Overview\n{description}\n\n## Highlights\n{features}\n\n"
+        f"## Tech stack\n{stack}\n\n"
+        f"## Getting started\n```bash\ngit clone {repo_url}.git\n```\n"
+        f"Then follow the setup steps in the repository to run {name} locally.\n"
+    )
+    pitch = (
+        f"## Inspiration\nWe wanted to build something people could pick up and use immediately. {name} is the result.\n\n"
+        f"## What it does\n{description}\n\n{features}\n\n"
+        f"## How we built it\nBuilt with {stack}, and deployed live at {host}.\n\n"
+        f"## Challenges we ran into\nKeeping the experience fast and simple while shipping on a hackathon clock.\n\n"
+        f"## Accomplishments that we're proud of\nA working product you can try right now at {app_url}.\n\n"
+        f"## What we learned\nTight scope, real users, and a live demo beat slideware every time.\n\n"
+        f"## What's next\nMore features, more feedback, and opening it up to more people. Follow along at {repo_url}."
+    )
+    thread = [
+        f"Introducing {name}: {tagline} 🚀",
+        f"What it does: {description}"[:270],
+        f"Built with {stack}."[:270],
+        f"Try the live demo: {app_url}",
+        f"Star the repo and follow along: {repo_url} #buildinpublic",
+    ]
+    linkedin = (
+        f"Excited to share {name}: {tagline}.\n\n{description}\n\n"
+        f"It's live now at {app_url}, and the code is open at {repo_url}.\n\n"
+        f"Built with {stack}. Feedback is very welcome!"
+    )
+    return LaunchKit(readme_markdown=readme, devpost_pitch=pitch, x_thread=thread, linkedin_post=linkedin)

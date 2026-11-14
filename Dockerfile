@@ -1,13 +1,15 @@
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
-    DEBIAN_FRONTEND=noninteractive
+    DEBIAN_FRONTEND=noninteractive \
+    STORAGE_DIR=/app/storage
 
 WORKDIR /app
 
-# Install OS dependencies including FFmpeg and browser libraries
+# FFmpeg for muxing, espeak-ng as the offline narration fallback, plus browser libraries
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    espeak-ng \
     curl \
     git \
     ca-certificates \

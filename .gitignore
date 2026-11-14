@@ -1,0 +1,16 @@
+# virtual environments
+.venv/
+venv/
+
+# secrets (keep .env.example committed)
+.env
+
+# generated media: per-job audio, recordings, and demo.mp4 output
+storage/
+
+# python caches
+__pycache__/
+*.pyc
+
+# OS noise
+.DS_Store
