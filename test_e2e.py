@@ -44,7 +44,9 @@ async def validate(job: JobStatus) -> List[Tuple[str, bool, str]]:
     media = await describe_media(path)
     boxes = mp4_box_order(path)
     scenes = job.storyboard.scenes if job.storyboard else []
-    expected = sum(s.duration_sec for s in scenes)  # per-scene clip lengths (narration + tail)
+    storyboard = job.storyboard
+    # per-scene clip lengths (narration + tail), plus the AI intro/outro when present
+    expected = sum(s.duration_sec for s in scenes) + (storyboard.intro_sec + storyboard.outro_sec if storyboard else 0)
     av_gap = abs(media["video_duration"] - media["audio_duration"])
     kit = job.launch_kit
     return [
@@ -58,7 +60,8 @@ async def validate(job: JobStatus) -> List[Tuple[str, bool, str]]:
         ("audio and video durations match (<=100 ms)", av_gap <= 0.1,
          f"video {media['video_duration']:.3f}s, audio {media['audio_duration']:.3f}s"),
         ("length matches the scene clips (+-0.5 s)", abs(media["duration"] - expected) <= 0.5,
-         f"{media['duration']:.2f}s vs expected {expected:.2f}s over {len(scenes)} scenes"),
+         f"{media['duration']:.2f}s vs expected {expected:.2f}s over {len(scenes)} scenes"
+         + (f" + {storyboard.intro_sec:.1f}s intro + {storyboard.outro_sec:.1f}s outro" if storyboard and storyboard.intro_sec else "")),
         ("moov atom before mdat (streams before full download)",
          "moov" in boxes and "mdat" in boxes and boxes.index("moov") < boxes.index("mdat"), " > ".join(boxes)),
         ("launch kit populated",
@@ -74,6 +77,7 @@ async def main() -> int:
     parser.add_argument("--seconds", type=int, default=30, help="Target demo length in seconds")
     parser.add_argument("--voice", default="energetic_tech", choices=["energetic_tech", "calm_expert", "fast_founder"])
     parser.add_argument("--timeout", type=float, default=900, help="Fail if the job takes longer (seconds)")
+    parser.add_argument("--ai-clips", action="store_true", help="Add the AI intro/outro (fal.ai video credits)")
     args = parser.parse_args()
 
     caps = capabilities()
@@ -92,6 +96,7 @@ async def main() -> int:
 
     job = create_pipeline_job(PipelineRequest(
         repo_url=args.repo, app_url=args.url, target_seconds=args.seconds, voice_style=args.voice,
+        ai_clips=args.ai_clips,
     ))
     print(f"Started pipeline job {job.job_id}")
 

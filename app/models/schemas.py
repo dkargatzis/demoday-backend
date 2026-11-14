@@ -23,6 +23,8 @@ class PipelineRequest(BaseModel):
     voice_style: VoiceStyle = Field(default="energetic_tech", description="Narration voice and tone")
     target_seconds: int = Field(default=60, ge=15, le=120, description="Target total runtime in seconds")
     use_app_login: bool = Field(default=True, description="Record signed in when a saved app login matches the app")
+    ai_clips: bool = Field(default=False, description="Add an AI-generated intro and outro (fal.ai video credits)")
+    use_staged_data: bool = Field(default=True, description="Replay staged sample data when a set exists for the app")
 
     @field_validator("app_url")
     @classmethod
@@ -67,6 +69,10 @@ class Storyboard(BaseModel):
     tagline: str
     scenes: List[Scene]
     total_duration_sec: float = 0.0
+    intro_sec: float = 0.0  # length of the intro before scene 1 in demo.mp4 (0 without AI clips)
+    outro_sec: float = 0.0
+    intro_visual: Optional[str] = None  # Gemini's shot descriptions for the AI clips
+    outro_visual: Optional[str] = None
 
 
 class LaunchKit(BaseModel):

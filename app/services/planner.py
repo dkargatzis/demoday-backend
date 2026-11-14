@@ -20,6 +20,7 @@ GEMINI_TIMEOUT_SEC = 90
 # at or under the requested length.
 WORDS_PER_SECOND = {"energetic_tech": 2.0, "calm_expert": 1.7, "fast_founder": 2.1}
 TAIL_ALLOWANCE_SEC = 2.0  # ~5 scenes x 0.4 s of breathing room added after each narration line
+BOOKEND_ALLOWANCE_SEC = 9.0  # AI intro + outro, about 4.5 s each
 ALLOWED_ACTIONS = {"navigate", "click", "type", "scroll", "wait"}
 TONES = {
     "energetic_tech": "high-energy tech founder: upbeat, confident, crisp",
@@ -87,7 +88,7 @@ def _summary(repo_info: dict, app_info: dict) -> str:
 
 def _repo_urls(repo_info: dict, fallback: str = "") -> List[str]:
     urls = [repo["url"] for repo in repo_info.get("repos", []) if repo.get("url")]
-    return urls or [u.strip() for u in fallback.split(",") if u.strip()]
+    return urls or [u.strip() for u in (fallback or "").split(",") if u.strip()]
 
 
 def _repo_lines(repo_info: dict, fallback: str = "") -> str:
@@ -149,11 +150,24 @@ def _inventory_lines(app_info: dict) -> str:
 
 async def generate_storyboard(
     repo_info: dict, app_info: dict, target_seconds: int = 60, voice_style: str = "energetic_tech",
-    repo_url: str = "",
+    repo_url: str = "", ai_clips: bool = False,
 ) -> Tuple[Storyboard, str]:
-    """Returns (storyboard, human-readable note on which planner produced it)."""
+    """Returns (storyboard, human-readable note on which planner produced it).
+
+    With `ai_clips`, the intro/outro take part of the runtime and Gemini also describes the shots for them.
+    """
     name = project_name(repo_info, app_info)
-    total_words = int((target_seconds - TAIL_ALLOWANCE_SEC) * WORDS_PER_SECOND.get(voice_style, 2.4))
+    narrated_sec = target_seconds - TAIL_ALLOWANCE_SEC - (BOOKEND_ALLOWANCE_SEC if ai_clips else 0)
+    total_words = max(30, int(narrated_sec * WORDS_PER_SECOND.get(voice_style, 2.4)))
+    bookend_rule = bookend_json = ""
+    if ai_clips:
+        bookend_rule = f"""
+7. The video opens with an intro card that already introduces {name} by name and closes with an outro card showing
+   the URL, so scene 1 starts with the problem and the last scene doesn't repeat the URL. Also write "intro_visual"
+   and "outro_visual": one or two sentences each describing a 5-second cinematic shot that an AI video model will
+   film behind those cards. Evoke the product's domain with abstract or atmospheric imagery and slow camera motion.
+   They must contain no text, letters, logos, screens, user interfaces or people."""
+        bookend_json = ' "intro_visual": "...", "outro_visual": "...",'
     prompt = f"""You are directing a {target_seconds}-second product demo video for a hackathon submission.
 A headless browser (1920x1080) performs your actions on the LIVE app while a voiceover reads your narration.
 
@@ -191,8 +205,8 @@ RULES
 5. The browser may be signed in to the user's real account: never sign out, delete, remove, cancel, purchase,
    or change settings. Show, don't modify.
 6. Respond with JSON only:
-{{"project_name": "{name}", "tagline": "one punchy line", "scenes": [{{"id": "scene-1", "title": "...", "route": "/",
-  "narration": "...", "actions": [{{"type": "scroll", "value": "down", "dwell_ms": 1500}}]}}]}}
+{{"project_name": "{name}", "tagline": "one punchy line",{bookend_json} "scenes": [{{"id": "scene-1", "title": "...",
+  "route": "/", "narration": "...", "actions": [{{"type": "scroll", "value": "down", "dwell_ms": 1500}}]}}]}}{bookend_rule}
 """
     if get_secret("GEMINI_API_KEY"):
         try:
@@ -235,6 +249,8 @@ def _sanitize_storyboard(data: Any, fallback_name: str) -> Storyboard:
         project_name=str(data.get("project_name") or fallback_name)[:80],
         tagline=_clean_narration(data.get("tagline"))[:140],
         scenes=scenes[:6],
+        intro_visual=_clean_narration(data.get("intro_visual"))[:400] or None,
+        outro_visual=_clean_narration(data.get("outro_visual"))[:400] or None,
     )
 
 

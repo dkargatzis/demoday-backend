@@ -15,9 +15,10 @@ from pydantic import BaseModel, Field, field_validator
 from app.config import GEMINI_MODEL, GITHUB_API_URL, capabilities, storage_root  # loads .env before anything else
 from app import auth, db, vault
 from app.models.schemas import JobStatus, PipelineRequest, _http_url
-from app.services.capture import CAPTURES
+from app.services import fixtures
+from app.services.capture import CAPTURES, origin_of
 from app.services.capture import VIEWPORT as CAPTURE_VIEWPORT
-from app.services.netguard import BlockedURL
+from app.services.netguard import BlockedURL, ensure_public_url
 from app.services.orchestrator import JOBS, create_pipeline_job, stream_job_events
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
@@ -276,3 +277,96 @@ async def capture_socket(websocket: WebSocket, capture_id: str):
         pass
     finally:
         receiver.cancel()
+
+
+# --------------------------------------------------------------------------- staged sample data
+
+
+class FixtureCaptureIn(BaseModel):
+    app_url: str
+
+    @field_validator("app_url")
+    @classmethod
+    def _check_url(cls, value: str) -> str:
+        return _http_url(value)
+
+
+class FixturePolishIn(BaseModel):
+    brief: str = Field(default="", max_length=500)
+
+
+class FixtureUpdateIn(BaseModel):
+    entries: list
+
+
+@app.get("/api/fixtures")
+async def list_fixtures(user: Dict = Depends(auth.current_user)):
+    return fixtures.list_sets(user["id"])
+
+
+@app.get("/api/fixtures/{set_id}")
+async def get_fixture(set_id: str, user: Dict = Depends(auth.current_user)):
+    found = fixtures.get_set(user["id"], set_id)
+    if found is None:
+        raise HTTPException(404, "Sample data set not found")
+    return found
+
+
+@app.post("/api/fixtures/capture")
+async def capture_fixture(body: FixtureCaptureIn, user: Dict = Depends(auth.current_user)):
+    """Loads the app (signed in when a login is saved) and records its JSON API responses as a new set."""
+    from app.services.recorder import declutter_page, settle_page
+
+    try:
+        await ensure_public_url(body.app_url)
+    except BlockedURL as exc:
+        raise HTTPException(400, str(exc))
+    origin = origin_of(body.app_url)
+    storage_state = None
+    if vault.available():
+        try:
+            saved = vault.get(user["id"], "app_login", origin)
+            storage_state = json.loads(saved) if saved else None
+        except vault.VaultUnavailable:
+            storage_state = None
+    try:
+        entries = await fixtures.capture_fixtures(body.app_url, storage_state, settle_page, declutter_page)
+    except Exception as exc:
+        logger.exception("fixture capture failed")
+        raise HTTPException(502, f"Couldn't load {body.app_url}: {str(exc).strip().splitlines()[0][:160]}")
+    if not entries:
+        raise HTTPException(422, "The page made no JSON API calls, so there is nothing to stage. "
+                                 "Sample data needs pages that load their data from JSON APIs in the browser.")
+    return fixtures.save_set(user["id"], origin, entries, polished=False)
+
+
+@app.post("/api/fixtures/{set_id}/polish")
+async def polish_fixture(set_id: str, body: FixturePolishIn, user: Dict = Depends(auth.current_user)):
+    found = fixtures.get_set(user["id"], set_id)
+    if found is None:
+        raise HTTPException(404, "Sample data set not found")
+    try:
+        entries, note = await fixtures.polish_with_gemini(found["entries"], found["origin"], body.brief)
+    except Exception as exc:
+        raise HTTPException(502, f"Gemini couldn't improve the data: {str(exc).strip().splitlines()[0][:200]}")
+    saved = fixtures.save_set(user["id"], found["origin"], entries, polished=True, brief=body.brief)
+    return {**saved, "note": note}
+
+
+@app.put("/api/fixtures/{set_id}")
+async def update_fixture(set_id: str, body: FixtureUpdateIn, user: Dict = Depends(auth.current_user)):
+    found = fixtures.get_set(user["id"], set_id)
+    if found is None:
+        raise HTTPException(404, "Sample data set not found")
+    try:
+        entries = fixtures.validate_entries(body.entries)
+        return fixtures.save_set(user["id"], found["origin"], entries, polished=found["polished"], brief=found["brief"])
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+
+
+@app.delete("/api/fixtures/{set_id}")
+async def delete_fixture(set_id: str, user: Dict = Depends(auth.current_user)):
+    if not fixtures.delete_set(user["id"], set_id):
+        raise HTTPException(404, "Sample data set not found")
+    return {"ok": True}

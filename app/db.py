@@ -29,6 +29,16 @@ CREATE TABLE IF NOT EXISTS secrets (
   created_at REAL NOT NULL,
   UNIQUE (user_id, kind, name)
 );
+CREATE TABLE IF NOT EXISTS fixtures (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  origin TEXT NOT NULL,
+  entries TEXT NOT NULL,
+  polished INTEGER NOT NULL DEFAULT 0,
+  brief TEXT NOT NULL DEFAULT '',
+  updated_at REAL NOT NULL,
+  UNIQUE (user_id, origin)
+);
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,

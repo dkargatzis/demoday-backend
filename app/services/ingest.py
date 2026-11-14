@@ -12,7 +12,7 @@ from playwright.async_api import async_playwright
 
 from app.config import GITHUB_API_URL, GITHUB_RAW_URL, get_secret
 from app.services.netguard import guard_context
-from app.services.recorder import VIEWPORT, is_risky, launch_chromium
+from app.services.recorder import VIEWPORT, declutter_page, is_risky, launch_chromium, wait_for_loaders
 
 GITHUB_API = GITHUB_API_URL
 RAW_GITHUB = GITHUB_RAW_URL
@@ -316,7 +316,7 @@ def _stable_id(value: str) -> bool:
     return bool(value) and not _GENERATED_ID.search(value)
 
 
-async def probe_app_url(app_url: str, storage_state: Optional[Dict] = None) -> Dict[str, Any]:
+async def probe_app_url(app_url: str, storage_state: Optional[Dict] = None, replayer=None) -> Dict[str, Any]:
     """Renders the app in headless Chromium (so SPAs work) and inventories what a demo could interact with.
 
     `storage_state` (a saved sign-in session) probes the app as the signed-in user. `login_form` reports a visible
@@ -330,6 +330,8 @@ async def probe_app_url(app_url: str, storage_state: Optional[Dict] = None) -> D
             context = await browser.new_context(viewport=VIEWPORT, locale="en-US", storage_state=storage_state,
                                                 service_workers="block")
             await guard_context(context)
+            if replayer is not None:
+                await replayer.install(context)
             page = await context.new_page()
             try:
                 response = await page.goto(app_url, wait_until="domcontentloaded", timeout=25_000)
@@ -343,6 +345,8 @@ async def probe_app_url(app_url: str, storage_state: Optional[Dict] = None) -> D
                 await page.wait_for_load_state("networkidle", timeout=5000)
             except PlaywrightError:
                 pass
+            await wait_for_loaders(page)
+            await declutter_page(page)  # inventory the page as the recording will show it
             result["url"] = page.url
             raw = await page.evaluate(INVENTORY_SCRIPT)
         finally:

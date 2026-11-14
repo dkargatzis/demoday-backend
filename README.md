@@ -32,7 +32,8 @@ cp .env.example .env
 | Variable | Purpose |
 | --- | --- |
 | `GEMINI_API_KEY` | Google AI Studio key. Without it, storyboards and launch kits use templates. |
-| `FAL_KEY` | fal.ai key for Kokoro narration. Without it, narration uses local TTS. |
+| `FAL_KEY` | fal.ai key for Kokoro narration and the optional AI intro/outro. Without it, narration uses local TTS. |
+| `FAL_VIDEO_MODEL` | Optional text-to-video model for the AI intro/outro, default `fal-ai/bytedance/seedance/v1/pro/fast/text-to-video` (1080p, about $0.25 per clip). Kling (`fal-ai/kling-video/v3/pro/text-to-video`) also works. |
 | `GEMINI_MODEL` | Optional, default `gemini-3.6-flash` (`gemini-2.0-flash` was shut down on 2026-06-01). |
 | `DEMODAY_SECRET_KEY` | Encrypts users' saved GitHub tokens and app logins (32 random bytes, base64; `run.sh` generates one). Keep it stable: changing it makes saved credentials unreadable. |
 | `SIGNUP_CODE` | Optional; when set, creating an account requires this code. |
@@ -55,7 +56,7 @@ videos and saved credentials are only visible to their owner.
 | --- | --- |
 | `GET /api/health` | Status plus capabilities (`ffmpeg`, `gemini`, `fal`, `gemini_model`, `vault`, `signup_code`) |
 | `POST /api/auth/signup`, `/login`, `/logout`; `GET /api/auth/me` | Accounts and sessions |
-| `POST /api/pipeline/start` | Start a job: `{repo_urls[], app_url, voice_style, target_seconds, use_app_login}` (`repo_url` still accepted) |
+| `POST /api/pipeline/start` | Start a job: `{repo_urls[], app_url, voice_style, target_seconds, use_app_login, ai_clips, use_staged_data}` (`repo_url` still accepted) |
 | `GET /api/pipeline/events/{job_id}` | SSE stream of full job snapshots (`/stream/{job_id}` is an alias) |
 | `GET /api/pipeline/status/{job_id}` | Current job snapshot (finished jobs reload from `job.json` after a restart) |
 | `GET /api/pipeline/video/{job_id}` | The MP4 (supports range requests; `?download=1` for an attachment) |
@@ -64,6 +65,35 @@ videos and saved credentials are only visible to their owner.
 | `POST /api/app-logins/capture`; `WS .../capture/{id}/ws`; `POST .../capture/{id}/finish` | Live sign-in: a server browser streamed to the dashboard; finishing saves only its session, encrypted |
 
 Each job writes its media and a `job.json` (storyboard, launch kit, logs) to `storage/<job_id>/`.
+
+### AI intro and outro (optional)
+
+With `ai_clips`, Gemini also describes two short cinematic shots (no text, screens or people), and fal.ai generates
+them while the browser records, so they add little time. The project name, tagline and URL are typeset on top by the
+browser (never drawn by the model), and the demo's voice reads one line over each. If fal.ai is unavailable or slow,
+each bookend falls back to the typeset title on a slowly zooming gradient. The storyboard's `intro_sec` tells the
+dashboard where scene 1 starts. Two clips cost about $0.50 with the default model.
+
+### Polished walkthroughs
+
+- **Clean frames:** before each scene the recorder accepts (or hides) cookie-consent banners, hides chat,
+  scheduling and feedback widgets and promo pop-ups, and waits for skeletons and spinners to finish, so no
+  frame shows a half-loaded page. Everything it does is listed in the job log.
+- **Focus zoom and highlights:** every click or typed field gets a highlight ring, and the finished video glides
+  toward it (about 1.5x) and back, so dashboard details stay readable at 1080p. Scrolls and navigations release
+  the zoom.
+- **Staged sample data:** in Settings, DemoDay loads the app (signed in, when a login is saved), follows its
+  navigation links and records the JSON its pages fetch. Gemini rewrites those responses as well-populated
+  sample data with exactly the same structure (reviewed and editable in Settings), and demos replay them instead
+  of calling the real API. The video carries a "Sample data" label, and the form has a toggle per run. This works
+  for pages that load their data from JSON APIs in the browser (not server-rendered HTML).
+
+| Endpoint | Description |
+| --- | --- |
+| `GET /api/fixtures`, `GET /api/fixtures/{id}` | The user's staged data sets (one per app origin) |
+| `POST /api/fixtures/capture` | Load `app_url` and record its JSON API responses into a set |
+| `POST /api/fixtures/{id}/polish` | Rewrite the set with Gemini (`brief` steers it); schema-checked |
+| `PUT /api/fixtures/{id}`, `DELETE /api/fixtures/{id}` | Edit (JSON-validated) or remove a set |
 
 ### Signed-in recording and private repositories
 
@@ -90,6 +120,7 @@ Each job writes its media and a `job.json` (storyboard, launch kit, logs) to `st
 ```bash
 python test_e2e.py                     # FastAPI repo + fastapi.tiangolo.com, 30 s
 python test_e2e.py --repo <github-url> --url <app-url> --seconds 45 --voice calm_expert
+python test_e2e.py --ai-clips             # with the AI intro/outro (uses fal.ai video credits)
 ```
 Runs a full job in-process and checks the output: H.264/yuv420p 1920x1080, AAC 48 kHz, audio/video durations within 100 ms, fast start, and a populated launch kit. Exits non-zero on any failure.
 
