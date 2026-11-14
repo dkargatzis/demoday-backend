@@ -1,26 +1,47 @@
 from typing import List, Literal, Optional
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 VoiceStyle = Literal["energetic_tech", "calm_expert", "fast_founder"]
+MAX_REPOS = 5
+
+
+def _http_url(value: str) -> str:
+    # URLs are opened by a real browser, so only http(s) is allowed (no file://, chrome://, ...).
+    value = value.strip()
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(f"{value!r} must be an http(s) URL")
+    return value
 
 
 class PipelineRequest(BaseModel):
-    repo_url: str = Field(..., description="GitHub repository URL")
+    repo_urls: List[str] = Field(default_factory=list, description=f"GitHub repositories, up to {MAX_REPOS}")
+    repo_url: Optional[str] = Field(default=None, description="Single repository (older clients); merged into repo_urls")
     app_url: str = Field(..., description="Deployed live web application URL")
     voice_style: VoiceStyle = Field(default="energetic_tech", description="Narration voice and tone")
     target_seconds: int = Field(default=60, ge=15, le=120, description="Target total runtime in seconds")
+    use_app_login: bool = Field(default=True, description="Record signed in when a saved app login matches the app")
 
-    @field_validator("repo_url", "app_url")
+    @field_validator("app_url")
     @classmethod
     def _require_http_url(cls, value: str) -> str:
-        # The app URL is opened in a real browser, so only http(s) is allowed (no file://, chrome://, ...).
-        value = value.strip()
-        parsed = urlparse(value)
-        if parsed.scheme not in ("http", "https") or not parsed.netloc:
-            raise ValueError("must be an http(s) URL")
-        return value
+        return _http_url(value)
+
+    @model_validator(mode="after")
+    def _collect_repos(self) -> "PipelineRequest":
+        urls: List[str] = []
+        for raw in [*self.repo_urls, self.repo_url]:
+            if raw and raw.strip():
+                url = _http_url(raw)
+                if url not in urls:
+                    urls.append(url)
+        if len(urls) > MAX_REPOS:
+            raise ValueError(f"at most {MAX_REPOS} repositories per demo")
+        self.repo_urls = urls
+        self.repo_url = urls[0] if urls else None
+        return self
 
 
 class Action(BaseModel):

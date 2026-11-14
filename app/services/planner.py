@@ -51,7 +51,8 @@ async def _generate_json(prompt: str) -> Any:
     if not text:
         raise ValueError("Gemini returned an empty response")
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)  # tolerate fenced output
-    return json.loads(text)
+    # strict=False accepts raw newlines/tabs inside string values, which Gemini sometimes emits in long Markdown fields.
+    return json.loads(text, strict=False)
 
 
 def _failure_reason(exc: Exception) -> str:
@@ -63,13 +64,17 @@ def _failure_reason(exc: Exception) -> str:
 
 
 def project_name(repo_info: dict, app_info: dict) -> str:
-    """Repo name, re-cased from the app title when they match (fastapi + "FastAPI" -> FastAPI)."""
-    name = repo_info.get("name") or ""
-    title = app_info.get("title") or ""
-    if name:
-        match = re.search(re.escape(name.replace("-", " ")), title.replace("-", " "), re.IGNORECASE)
-        return title[match.start():match.end()] if match else name
-    return title.split("|")[0].split(" - ")[0].strip() or "This project"
+    """Display name: the app title's leading segment when it names the repo as a whole word
+    (repo "ui" + "shadcn/ui - The Foundation..." -> shadcn/ui; repo "fastapi" + "FastAPI - FastAPI" -> FastAPI),
+    otherwise the repo name."""
+    name = (repo_info.get("name") or "").strip()
+    title = (app_info.get("title") or "").strip()
+    lead = re.split(r"\s+[-|–—:]\s+", title, maxsplit=1)[0].strip()
+    if name and lead and len(lead) <= 40:
+        whole_word = r"(?<![A-Za-z0-9])" + re.escape(name.replace("-", " ")) + r"(?![A-Za-z0-9])"
+        if re.search(whole_word, lead.replace("-", " "), re.IGNORECASE):
+            return lead
+    return name or lead or "This project"
 
 
 def _summary(repo_info: dict, app_info: dict) -> str:
@@ -78,6 +83,18 @@ def _summary(repo_info: dict, app_info: dict) -> str:
         return ""
     first = re.split(r"(?<=[.!?])\s", text, maxsplit=1)[0].strip()
     return first if first.endswith((".", "!", "?")) else first + "."
+
+
+def _repo_urls(repo_info: dict, fallback: str = "") -> List[str]:
+    urls = [repo["url"] for repo in repo_info.get("repos", []) if repo.get("url")]
+    return urls or [u.strip() for u in fallback.split(",") if u.strip()]
+
+
+def _repo_lines(repo_info: dict, fallback: str = "") -> str:
+    repos = repo_info.get("repos") or [{"url": u, "description": repo_info.get("description", "")}
+                                       for u in _repo_urls(repo_info, fallback)]
+    lines = [f"- Repository: {r['url']}" + (f" - {r['description']}" if r.get("description") else "") for r in repos]
+    return "\n".join(lines) or "- Repository: none given"
 
 
 def _pick_nav_link(links: List[dict]) -> Optional[dict]:
@@ -142,7 +159,7 @@ A headless browser (1920x1080) performs your actions on the LIVE app while a voi
 
 PROJECT
 - Name: {name}
-- Repository: {repo_url} - {repo_info.get('description', '')}
+{_repo_lines(repo_info, repo_url)}
 - Language: {repo_info.get('language', '')}; dependencies: {', '.join(repo_info.get('dependencies', [])[:20])}
 - Live app: {app_info.get('url', '')} - title "{app_info.get('title', '')}"; description: "{app_info.get('description', '')}"
 - Headings on the landing page: {' | '.join(app_info.get('headings', [])[:8])}
@@ -171,7 +188,9 @@ RULES
    Only use selectors from the list. When unsure, scroll or wait instead of guessing.
    Keep each scene's total dwell close to its narration time (about 400 ms per word): the scene ends when its
    narration ends, and later actions are skipped.
-5. Respond with JSON only:
+5. The browser may be signed in to the user's real account: never sign out, delete, remove, cancel, purchase,
+   or change settings. Show, don't modify.
+6. Respond with JSON only:
 {{"project_name": "{name}", "tagline": "one punchy line", "scenes": [{{"id": "scene-1", "title": "...", "route": "/",
   "narration": "...", "actions": [{{"type": "scroll", "value": "down", "dwell_ms": 1500}}]}}]}}
 """
@@ -277,7 +296,7 @@ async def generate_launch_kit(
 the context below; never invent metrics, users, or features.
 
 PROJECT: {name} - {tagline}
-Repository: {repo_url}
+Repositories: {', '.join(_repo_urls(repo_info, repo_url)) or 'none given'}
 Live demo: {app_url}
 Description: {repo_info.get('description', '') or app_info.get('description', '')}
 Language: {repo_info.get('language', '')}; dependencies: {', '.join(repo_info.get('dependencies', [])[:20])}
@@ -337,13 +356,16 @@ def _template_launch_kit(storyboard: Storyboard, repo_info: dict, app_info: dict
         or [h for h in app_info.get("headings", []) if 3 <= len(h) <= 80][:5]
     features = "\n".join(f"- {h}" for h in highlights) or f"- {description}"
     host = urlparse(app_url).netloc or app_url
+    urls = _repo_urls(repo_info, repo_url)
+    repo_url = urls[0] if urls else app_url  # primary link for posts
+    clone = "".join(f"git clone {u}.git\n" for u in urls)
     readme = (
         f"# {name}\n\n> {tagline}\n\n"
-        f"**Live demo:** {app_url}  \n**Source:** {repo_url}\n\n"
+        f"**Live demo:** {app_url}  \n**Source:** {', '.join(urls) or 'not public'}\n\n"
         f"## Overview\n{description}\n\n## Highlights\n{features}\n\n"
         f"## Tech stack\n{stack}\n\n"
-        f"## Getting started\n```bash\ngit clone {repo_url}.git\n```\n"
-        f"Then follow the setup steps in the repository to run {name} locally.\n"
+        + (f"## Getting started\n```bash\n{clone}```\n"
+           f"Then follow the setup steps in the repositories to run {name} locally.\n" if urls else "")
     )
     pitch = (
         f"## Inspiration\nWe wanted to build something people could pick up and use immediately. {name} is the result.\n\n"
@@ -363,7 +385,7 @@ def _template_launch_kit(storyboard: Storyboard, repo_info: dict, app_info: dict
     ]
     linkedin = (
         f"Excited to share {name}: {tagline}.\n\n{description}\n\n"
-        f"It's live now at {app_url}, and the code is open at {repo_url}.\n\n"
+        f"It's live now at {app_url}" + (f", and the code is open at {', '.join(urls)}" if urls else "") + ".\n\n"
         f"Built with {stack}. Feedback is very welcome!"
     )
     return LaunchKit(readme_markdown=readme, devpost_pitch=pitch, x_thread=thread, linkedin_post=linkedin)

@@ -1,21 +1,23 @@
-"""Context gathering: GitHub repository metadata and a rendered inventory of the live app."""
+"""Context gathering: GitHub repositories (public or private) and a rendered inventory of the live app."""
 import asyncio
 import json
 import re
 import tomllib
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urlparse
 
 import httpx
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import async_playwright
 
-from app.config import get_secret
-from app.services.recorder import VIEWPORT, launch_chromium
+from app.config import GITHUB_API_URL, GITHUB_RAW_URL, get_secret
+from app.services.netguard import guard_context
+from app.services.recorder import VIEWPORT, is_risky, launch_chromium
 
-GITHUB_API = "https://api.github.com"
-RAW_GITHUB = "https://raw.githubusercontent.com"
+GITHUB_API = GITHUB_API_URL
+RAW_GITHUB = GITHUB_RAW_URL
 MANIFESTS = ("package.json", "requirements.txt", "pyproject.toml")
+MAX_REPOS = 5
 
 
 # --------------------------------------------------------------------------- GitHub
@@ -29,37 +31,97 @@ def parse_github_url(repo_url: str) -> Optional[tuple]:
     return match.group(1), repo[:-4] if repo.endswith(".git") else repo
 
 
-async def extract_github_context(repo_url: str) -> Dict[str, Any]:
+async def extract_repos_context(repo_urls: List[str], token: Optional[str] = None) -> Dict[str, Any]:
+    """Merges several repositories (for example a frontend and a backend) into one planning context.
+
+    The first repository names the project; READMEs share the prompt budget; dependencies and routes are combined.
+    """
+    if not repo_urls:
+        return {"name": "", "full_name": "", "description": "", "language": "", "readme": "", "dependencies": [],
+                "routes": [], "repos": [], "notes": ["No repository given; planning from the live app only"]}
+    urls = repo_urls[:MAX_REPOS]
+    infos = await asyncio.gather(*(extract_github_context(url, token) for url in urls))
+    merged = dict(infos[0])
+    if len(infos) > 1:
+        budget = max(1500, 6000 // len(infos))
+        merged["readme"] = "\n\n".join(f"## {info.get('full_name') or url}\n{info['readme'][:budget]}"
+                                       for url, info in zip(urls, infos) if info.get("readme"))
+        merged["dependencies"] = _unique(d for info in infos for d in info.get("dependencies", []))[:30]
+        merged["routes"] = _unique(r for info in infos for r in info.get("routes", []))[:30]
+        merged["description"] = next((info["description"] for info in infos if info.get("description")), "")
+        merged["language"] = ", ".join(_unique(info.get("language", "") for info in infos))
+    merged["repos"] = [{"url": url, "full_name": info.get("full_name") or url, "private": info.get("private", False),
+                        "description": info.get("description", ""), "language": info.get("language", "")}
+                       for url, info in zip(urls, infos)]
+    merged["notes"] = [note for info in infos for note in info.get("notes", [])]
+    return merged
+
+
+def _unique(items: Iterable[str]) -> List[str]:
+    seen, out = set(), []
+    for item in items:
+        if item and item.lower() not in seen:
+            seen.add(item.lower())
+            out.append(item)
+    return out
+
+
+async def extract_github_context(repo_url: str, token: Optional[str] = None) -> Dict[str, Any]:
+    """README, metadata, dependencies and page routes of one repository.
+
+    `token` (the user's saved GitHub token) unlocks private repositories; the server's GITHUB_TOKEN is the fallback.
+    """
     parsed = parse_github_url(repo_url)
     if not parsed:
         return {"name": "", "readme": "", "description": "", "dependencies": [], "routes": [],
-                "notes": [f"{repo_url} is not a GitHub repository URL; continuing without repo context"]}
+                "notes": [f"{repo_url} is not a GitHub repository URL; continuing without its context"]}
     owner, repo = parsed
+    full = f"{owner}/{repo}"
+    token = token or get_secret("GITHUB_TOKEN") or None
     headers = {"User-Agent": "DemoDay-Launch-Studio", "Accept": "application/vnd.github+json"}
-    token = get_secret("GITHUB_TOKEN")
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    info: Dict[str, Any] = {"owner": owner, "repo": repo, "name": repo, "full_name": f"{owner}/{repo}",
+    info: Dict[str, Any] = {"owner": owner, "repo": repo, "name": repo, "full_name": full, "private": False,
                             "description": "", "homepage": "", "language": "", "topics": [], "stars": 0,
                             "readme": "", "dependencies": [], "routes": [], "notes": []}
 
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=headers) as client:
-        branch = None
-        meta = await _get_json(client, f"{GITHUB_API}/repos/{owner}/{repo}")
+        branch, token_rejected = None, False
+        resp = await _get(client, f"{GITHUB_API}/repos/{owner}/{repo}")
+        if resp is not None and resp.status_code == 401 and token:
+            info["notes"].append(f"GitHub rejected the token for {full} (expired or revoked); update it in Settings")
+            client.headers.pop("Authorization", None)
+            token, token_rejected = None, True
+            resp = await _get(client, f"{GITHUB_API}/repos/{owner}/{repo}")
+        status = resp.status_code if resp is not None else 0
+        meta = _json(resp) if status == 200 else None
         if meta:
             branch = meta.get("default_branch")
             info.update(
                 name=meta.get("name") or repo,
-                full_name=meta.get("full_name") or info["full_name"],
+                full_name=meta.get("full_name") or full,
+                private=bool(meta.get("private")),
                 description=meta.get("description") or "",
                 homepage=meta.get("homepage") or "",
                 language=meta.get("language") or "",
                 topics=meta.get("topics") or [],
                 stars=meta.get("stargazers_count") or 0,
             )
+        elif status == 404:
+            if token_rejected:
+                reason = "the saved GitHub token was rejected"
+            elif token:
+                reason = "your GitHub token can't access it"
+            else:
+                reason = "no GitHub token is saved. Add one in Settings to include private repositories"
+            info["notes"].append(f"{full} isn't visible: it doesn't exist, or it's private and {reason}")
+            return info
+        elif status in (403, 429):
+            info["notes"].append("GitHub API rate limit reached"
+                                 + ("" if token else "; add a GitHub token in Settings for higher limits"))
         else:
-            info["notes"].append("GitHub API unavailable (rate limit?): set GITHUB_TOKEN for richer repo context")
+            info["notes"].append(f"Couldn't reach GitHub for {full}")
 
         readme_task = _fetch_readme(client, owner, repo, branch)
         tree_task = _get_json(client, f"{GITHUB_API}/repos/{owner}/{repo}/git/trees/{branch}?recursive=1") if branch else None
@@ -79,6 +141,21 @@ async def extract_github_context(repo_url: str) -> Dict[str, Any]:
 
 async def _none():
     return None
+
+
+async def _get(client: httpx.AsyncClient, url: str) -> Optional[httpx.Response]:
+    try:
+        return await client.get(url)
+    except httpx.HTTPError:
+        return None
+
+
+def _json(resp: httpx.Response) -> Optional[Dict]:
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 async def _get_json(client: httpx.AsyncClient, url: str) -> Optional[Any]:
@@ -210,6 +287,7 @@ INVENTORY_SCRIPT = r"""
   };
   return {
     title: document.title || "",
+    hasPassword: Array.from(document.querySelectorAll("input[type=password]")).some(visible),
     description: meta("description") || meta("og:description"),
     headings: pick("h1, h2", 12).map(text).filter(Boolean),
     links: pick("a[href]", 120).map((a) => ({
@@ -229,21 +307,36 @@ def _quote(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-async def probe_app_url(app_url: str) -> Dict[str, Any]:
+# IDs generated per render (React useId ":r1:" / "_r_1_" / "«r1»", React Aria, Radix, Headless UI, MUI, long counters)
+# change on every page load, so a selector built from one never matches during recording.
+_GENERATED_ID = re.compile(r":r\w+:|_r_\w+_|«r\w+»|react-aria\d+|radix-|headlessui-|^mui-|\d{5,}", re.IGNORECASE)
+
+
+def _stable_id(value: str) -> bool:
+    return bool(value) and not _GENERATED_ID.search(value)
+
+
+async def probe_app_url(app_url: str, storage_state: Optional[Dict] = None) -> Dict[str, Any]:
     """Renders the app in headless Chromium (so SPAs work) and inventories what a demo could interact with.
 
-    Returns an `error` key when the page can't be loaded at all.
+    `storage_state` (a saved sign-in session) probes the app as the signed-in user. `login_form` reports a visible
+    password field, which usually means a sign-in wall. Returns an `error` key when the page can't be loaded at all.
     """
     result: Dict[str, Any] = {"url": app_url, "status": 0, "title": "", "description": "", "headings": [],
-                              "links": [], "buttons": [], "inputs": []}
+                              "links": [], "buttons": [], "inputs": [], "login_form": False}
     async with async_playwright() as pw:
         browser = await launch_chromium(pw)
         try:
-            page = await browser.new_page(viewport=VIEWPORT, locale="en-US")
+            context = await browser.new_context(viewport=VIEWPORT, locale="en-US", storage_state=storage_state,
+                                                service_workers="block")
+            await guard_context(context)
+            page = await context.new_page()
             try:
                 response = await page.goto(app_url, wait_until="domcontentloaded", timeout=25_000)
             except PlaywrightError as exc:
-                result["error"] = str(exc).strip().splitlines()[0][:200]
+                message = str(exc).strip().splitlines()[0][:200]
+                result["error"] = ("it redirected to a private network address, which isn't allowed"
+                                   if "ERR_BLOCKED_BY_CLIENT" in message else message)
                 return result
             result["status"] = response.status if response else 0
             try:
@@ -257,14 +350,16 @@ async def probe_app_url(app_url: str) -> Dict[str, Any]:
 
     origin = urlparse(result["url"]).netloc
     headings = [re.sub(r"[\s¶#🔗]+$", "", h) for h in raw["headings"]]  # drop permalink glyphs
-    result.update(title=raw["title"].strip(), description=raw["description"], headings=[h for h in headings if h])
+    result.update(title=raw["title"].strip(), description=raw["description"], headings=[h for h in headings if h],
+                  login_form=bool(raw.get("hasPassword")))
 
     seen_paths = set()
     for link in raw["links"]:
         href, label = link["href"].strip(), link["text"].strip()
         target = urlparse(link["abs"])
         if (not href or not label or '"' in label or href.startswith(("#", "javascript:", "mailto:", "tel:"))
-                or target.scheme not in ("http", "https") or target.netloc != origin):
+                or target.scheme not in ("http", "https") or target.netloc != origin
+                or is_risky(label=label, url=href)):  # never offer sign-out or destructive links to the planner
             continue
         path = target.path or "/"
         if target.query:
@@ -279,7 +374,9 @@ async def probe_app_url(app_url: str) -> Dict[str, Any]:
 
     for button in raw["buttons"]:
         label = button["text"].strip()
-        if button["id"]:
+        if is_risky(label=label or button["id"]):
+            continue
+        if _stable_id(button["id"]):
             selector = f'[id="{_quote(button["id"])}"]'
         elif label and '"' not in label:
             selector = f'role=button[name="{label}"]'
@@ -290,7 +387,7 @@ async def probe_app_url(app_url: str) -> Dict[str, Any]:
     for field in raw["inputs"]:
         tag = field["tag"]
         for attr, key in (("id", "id"), ("name", "name"), ("placeholder", "placeholder"), ("aria-label", "aria")):
-            if field[key]:
+            if field[key] and (attr != "id" or _stable_id(field["id"])):
                 selector = f'[id="{_quote(field["id"])}"]' if attr == "id" else f'{tag}[{attr}="{_quote(field[key])}"]'
                 result["inputs"].append({"label": field["placeholder"] or field["aria"] or field["name"] or field["id"],
                                          "selector": selector})

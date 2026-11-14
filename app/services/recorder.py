@@ -20,6 +20,7 @@ from playwright.async_api import Browser, Locator, Page, Playwright, async_playw
 from playwright.async_api import Error as PlaywrightError
 
 from app.models.schemas import Action, Scene
+from app.services.netguard import guard_context
 
 logger = logging.getLogger("demoday.recorder")
 
@@ -128,6 +129,25 @@ HIT_TEST_SCRIPT = r"""
 """
 
 
+# The browser may be signed in to the user's real account, so sign-out and destructive controls are never clicked,
+# whatever the storyboard says. (Logging out usually also invalidates the saved session on the server.)
+RISKY_LABEL = re.compile(
+    r"\b(log\s?out|sign\s?out|logout|signout|delete|remove|destroy|deactivate|close account|disable account|"
+    r"cancel (?:subscription|plan|account|membership)|unsubscribe|revoke|reset|archive|transfer|purchase|buy|pay|"
+    r"checkout|upgrade|downgrade|leave (?:team|workspace|organi[sz]ation))\b",
+    re.IGNORECASE,
+)
+RISKY_URL = re.compile(r"(log[-_]?out|sign[-_]?out|/delete|/destroy|/unsubscribe|/checkout|/billing)", re.IGNORECASE)
+ELEMENT_LABEL_SCRIPT = (
+    "el => [el.innerText, el.getAttribute('aria-label'), el.getAttribute('title'), el.value, el.getAttribute('href')]"
+    ".filter(Boolean).join(' ').slice(0, 300)"
+)
+
+
+def is_risky(label: str = "", url: str = "") -> bool:
+    return bool((label and RISKY_LABEL.search(label)) or (url and RISKY_URL.search(url)))
+
+
 @dataclass
 class SceneSegment:
     start: float     # seconds into the session recording where the scene's footage begins
@@ -178,8 +198,12 @@ async def record_session(
     output_path: Path,
     log: LogFn,
     on_scene: Optional[Callable[[int], None]] = None,
+    storage_state: Optional[Dict] = None,
 ) -> List[SceneSegment]:
-    """Records every scene in one 1920x1080 session and returns each scene's footage window."""
+    """Records every scene in one 1920x1080 session and returns each scene's footage window.
+
+    `storage_state` (a saved sign-in session) makes the browser start signed in to the app.
+    """
     output_path = Path(output_path)
     video_dir = Path(tempfile.mkdtemp(prefix="pw-video-", dir=output_path.parent))
     segments: List[SceneSegment] = []
@@ -195,7 +219,10 @@ async def record_session(
                     locale="en-US",
                     record_video_dir=str(video_dir),
                     record_video_size=VIEWPORT,
+                    storage_state=storage_state,
+                    service_workers="block",  # keeps every request visible to the network guard
                 )
+                await guard_context(context)
                 await context.add_init_script(INIT_SCRIPT)
                 page = await context.new_page()
                 session_start = time.monotonic()  # Playwright starts recording when the page is created
@@ -270,6 +297,9 @@ class _Director:
             if url is None:
                 self.log(f"Scene {scene_no}: navigate skipped (unsupported URL {action.value!r})")
                 return False
+            if is_risky(url=url):
+                self.log(f"Scene {scene_no}: skipped opening {url} (sign-out and destructive pages are never opened)")
+                return False
             await self._goto(url, scene_no)
             await self._quiet_network(min(2500, self._budget_ms(deadline)))
             return True
@@ -281,6 +311,9 @@ class _Director:
             # A link that isn't on this page still tells us where the scene wants to go.
             href = _link_href(action.selector) if action.type == "click" else None
             url = resolve_url(self.app_url, href) if href else None
+            if url and is_risky(url=url):
+                self.log(f"Scene {scene_no}: skipped {href!r} (sign-out and destructive actions are never clicked)")
+                return False
             if url:
                 self.log(f"Scene {scene_no}: link {href!r} not on screen, navigating to it directly")
                 await self._goto(url, scene_no)
@@ -288,6 +321,12 @@ class _Director:
                 return True
             self.log(f"Scene {scene_no}: selector {action.selector!r} not found, {action.type} skipped")
             return False
+        if action.type == "click":
+            label = await target.evaluate(ELEMENT_LABEL_SCRIPT)
+            if is_risky(label=label, url=label):
+                self.log(f"Scene {scene_no}: skipped clicking {label.strip()[:60]!r} "
+                         "(sign-out and destructive actions are never clicked)")
+                return False
         await self._point_at(target)
         if not await target.evaluate(HIT_TEST_SCRIPT):
             self.log(f"Scene {scene_no}: {action.selector!r} is hidden or covered, {action.type} skipped")
@@ -315,7 +354,8 @@ class _Director:
             if response is not None and response.status >= 400:
                 self.log(f"Scene {scene_no}: {url} answered HTTP {response.status}")
         except PlaywrightError as exc:
-            self.log(f"Scene {scene_no}: navigation to {url} failed ({_short(exc)})")
+            reason = "private network addresses are blocked" if "ERR_BLOCKED_BY_CLIENT" in str(exc) else _short(exc)
+            self.log(f"Scene {scene_no}: navigation to {url} failed ({reason})")
 
     async def _settle(self) -> None:
         """Best-effort wait until the page looks finished: loaded, network quiet, web fonts ready."""

@@ -1,15 +1,19 @@
 """Pipeline orchestration and live job state (in memory) streamed to the dashboard over SSE."""
 import asyncio
+import json
 import logging
 import time
 import uuid
 from pathlib import Path
-from typing import AsyncGenerator, Callable, Dict, Optional, Set
+from typing import AsyncGenerator, Callable, Dict, Optional, Set, Tuple
 
+from app import db, vault
 from app.config import storage_root
 from app.models.schemas import JobStatus, PipelineRequest
 from app.services.audio import synthesize_scene_audio
-from app.services.ingest import extract_github_context, probe_app_url
+from app.services.capture import origin_of
+from app.services.ingest import extract_repos_context, probe_app_url
+from app.services.netguard import BlockedURL, ensure_public_url
 from app.services.planner import generate_launch_kit, generate_storyboard
 from app.services.recorder import record_session
 from app.services.stitcher import concat_scenes, describe_media, frame_aligned, mux_scene_clip
@@ -31,7 +35,28 @@ def _job_logger(job: JobStatus) -> Callable[[str], None]:
     return log
 
 
-async def run_pipeline_task(job_id: str, req: PipelineRequest) -> None:
+def _user_secrets(user_id: Optional[str], req: PipelineRequest, log: Callable[[str], None]
+                  ) -> Tuple[Optional[str], Optional[Dict]]:
+    """The job owner's GitHub token and the saved sign-in session for the app's origin. Never logged."""
+    if not user_id:
+        return None, None
+    origin = origin_of(req.app_url)
+    try:
+        token = vault.get(user_id, "github_token", "default")
+        state = vault.get(user_id, "app_login", origin) if req.use_app_login else None
+    except vault.VaultUnavailable as exc:
+        log(f"Warning: saved credentials are unavailable ({exc}); continuing without them")
+        return None, None
+    if state is not None:
+        log(f"Recording signed in with your saved login for {origin}")
+    elif not req.use_app_login:
+        log("Recording signed out: saved login turned off for this run")
+    elif vault.list_kind(user_id, "app_login"):
+        log(f"No saved login for {origin}; recording as a signed-out visitor")
+    return (token.decode() if token else None), (json.loads(state) if state else None)
+
+
+async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional[str] = None) -> None:
     job = JOBS[job_id]
     log = _job_logger(job)
     job.status = "running"
@@ -42,32 +67,44 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest) -> None:
     try:  # everything, including setup, must land in a terminal state or the job hangs in "running"
         job_dir = storage_root() / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            await ensure_public_url(req.app_url)
+        except BlockedURL as exc:
+            raise RuntimeError(str(exc)) from None
+        github_token, storage_state = _user_secrets(user_id, req, log)
 
-        # 1. Ingest repository + live app
+        # 1. Ingest repositories + live app
         job.stage, job.progress = "ingesting", 5
-        log(f"Analyzing GitHub repository: {req.repo_url}")
+        for url in req.repo_urls:
+            log(f"Analyzing GitHub repository: {url}")
         log(f"Rendering live app in headless Chromium: {req.app_url}")
         repo_info, app_info = await asyncio.gather(
-            extract_github_context(req.repo_url), probe_app_url(req.app_url)
+            extract_repos_context(req.repo_urls, github_token), probe_app_url(req.app_url, storage_state)
         )
         if app_info.get("error"):
             raise RuntimeError(f"Navigation to {req.app_url} failed: {app_info['error']}")
         for note in repo_info.get("notes", []):
             log(note)
-        log(f"Repo {repo_info.get('full_name') or req.repo_url}: {len(repo_info.get('readme', ''))} chars of README, "
+        for repo in repo_info.get("repos", []):
+            log(f"Repo {repo['full_name']}{' (private)' if repo['private'] else ''} added to the context")
+        log(f"Repository context: {len(repo_info.get('readme', ''))} chars of README, "
             f"{len(repo_info.get('dependencies', []))} dependencies, {len(repo_info.get('routes', []))} page routes")
         status = app_info.get("status")
         log(f"Live app \"{app_info.get('title') or 'untitled'}\" (HTTP {status}): {len(app_info['links'])} links, "
             f"{len(app_info['buttons'])} buttons, {len(app_info['inputs'])} inputs")
         if status and status >= 400:
             log(f"Warning: the app answered HTTP {status}; the recording may show an error page")
+        if app_info.get("login_form"):
+            log("Warning: the app still shows a sign-in form with your saved login; it may have expired. "
+                "Capture the login again in Settings." if storage_state else
+                "Warning: the app shows a sign-in form. Save an app login in Settings to record signed-in pages.")
         job.progress = 20
 
         # 2. Plan the storyboard; write the launch kit in the background meanwhile
         job.stage = "planning"
         log("Planning the storyboard...")
         storyboard, note = await generate_storyboard(
-            repo_info, app_info, req.target_seconds, req.voice_style, req.repo_url
+            repo_info, app_info, req.target_seconds, req.voice_style, ", ".join(req.repo_urls)
         )
         log(note)
         job.storyboard = storyboard
@@ -103,7 +140,8 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest) -> None:
                 log(f"Scene {idx + 1}/{len(scenes)}: recording \"{scenes[idx].title}\" ({clip_durations[idx]:.1f}s)")
 
             session_path = job_dir / "session.webm"
-            segments = await record_session(scenes, req.app_url, clip_durations, session_path, log, on_scene)
+            segments = await record_session(scenes, req.app_url, clip_durations, session_path, log, on_scene,
+                                            storage_state=storage_state)
             job.progress = 65
 
             clips = []
@@ -153,11 +191,13 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest) -> None:
             logger.warning("[%s] could not write job.json: %s", job_id, exc)
 
 
-def create_pipeline_job(req: PipelineRequest) -> JobStatus:
-    job_id = uuid.uuid4().hex[:8]
+def create_pipeline_job(req: PipelineRequest, user_id: Optional[str] = None) -> JobStatus:
+    job_id = uuid.uuid4().hex[:12]
     job = JobStatus(job_id=job_id, status="queued", progress=0, stage="queued", logs=["Job queued"])
     JOBS[job_id] = job
-    task = asyncio.create_task(run_pipeline_task(job_id, req))
+    if user_id:
+        db.execute("INSERT INTO jobs (id, user_id, created_at) VALUES (?, ?, ?)", (job_id, user_id, time.time()))
+    task = asyncio.create_task(run_pipeline_task(job_id, req, user_id))
     _TASKS.add(task)
     task.add_done_callback(_TASKS.discard)
     return job

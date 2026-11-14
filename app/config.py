@@ -14,6 +14,13 @@ load_dotenv(BACKEND_ROOT / ".env")
 
 # gemini-2.0-flash was shut down on 2026-06-01; Google lists gemini-3.6-flash as its replacement.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+# GitHub endpoints, overridable for GitHub Enterprise Server.
+GITHUB_API_URL = os.getenv("GITHUB_API_URL", "https://api.github.com").rstrip("/")
+GITHUB_RAW_URL = os.getenv("GITHUB_RAW_URL", "https://raw.githubusercontent.com").rstrip("/")
+
+
+def env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def get_secret(name: str) -> str:
@@ -53,9 +60,13 @@ def storage_root() -> Path:
 
 
 def capabilities() -> dict:
+    from app import vault  # imported here to avoid a config <-> vault import cycle
+
     return {
         "ffmpeg": bool(shutil.which("ffmpeg") and shutil.which("ffprobe")),
         "gemini": bool(get_secret("GEMINI_API_KEY")),
         "fal": bool(get_secret("FAL_KEY")),
         "gemini_model": GEMINI_MODEL,
+        "vault": vault.available(),
+        "signup_code": bool(os.getenv("SIGNUP_CODE", "").strip()),
     }
