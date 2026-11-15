@@ -101,7 +101,7 @@ dashboard where scene 1 starts. Two clips cost about $0.50 with the default mode
 - **Private repositories:** each user can save a GitHub token (a fine-grained token with read-only Contents and
   Metadata is enough). Repositories the token can't see are reported in the job log rather than silently skipped.
 - **Pages behind a login:** in Settings, the user signs in to their app once through a live view of a server-side
-  browser (SSO and two-factor flows work). Only the resulting cookies and local storage are saved, encrypted with
+  browser (SSO and two-factor flows work). Only the resulting cookies, local storage and IndexedDB (where Firebase-style sign-ins keep the user) are saved, encrypted with
   AES-256-GCM and bound to that user; passwords are never stored. Jobs for the same app origin then record signed in.
 - **Safety:** recordings never click sign-out or destructive controls (delete, remove, cancel, purchase, ...), and a
   sign-in form that appears despite a saved login is reported as a likely expired session. Footage and AI planning

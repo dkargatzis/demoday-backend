@@ -18,7 +18,7 @@ from app import auth, db, vault
 from app.models.schemas import (AppLogin, CaptureStart, ErrorDetail, FixtureSet, FixtureSetSummary, GitHubConnection,
                                 HealthStatus, JobStatus, Ok, PipelineRequest, SettingsOut, ShareLink, _http_url)
 from app.services import cloud, fixtures
-from app.services.capture import CAPTURES, origin_of, unpack_login
+from app.services.capture import CAPTURES, indexed_db_records, origin_of, unpack_login
 from app.services.capture import VIEWPORT as CAPTURE_VIEWPORT
 from app.services.netguard import BlockedURL, ensure_public_url
 from app.services.orchestrator import JOBS, create_pipeline_job, stream_job_events
@@ -281,7 +281,7 @@ async def start_capture(body: CaptureStartIn, user: Dict = Depends(auth.current_
 
 
 @app.post("/api/app-logins/capture/{capture_id}/finish", response_model=AppLogin, tags=["app-logins"],
-          summary="Save the signed-in session (cookies and local storage, encrypted)",
+          summary="Save the signed-in session (cookies, local storage and IndexedDB, encrypted)",
           responses={400: {"model": ErrorDetail, "description": "No session yet: sign in first"},
                      401: {"model": ErrorDetail}, 404: {"model": ErrorDetail}})
 async def finish_capture(capture_id: str, user: Dict = Depends(auth.current_user)):
@@ -289,9 +289,10 @@ async def finish_capture(capture_id: str, user: Dict = Depends(auth.current_user
     if session is None:
         raise HTTPException(404, "This sign-in window has closed. Start again.")
     _require_vault()
-    state = await session.context.storage_state()
+    # IndexedDB included: Firebase Auth (GitHub/Google sign-in) keeps the signed-in user there, not in cookies.
+    state = await session.context.storage_state(indexed_db=True)
     cookies, origins = state.get("cookies", []), state.get("origins", [])
-    if not cookies and not any(o.get("localStorage") for o in origins):
+    if not cookies and not any(o.get("localStorage") for o in origins) and not indexed_db_records(state):
         raise HTTPException(400, "No session was found yet. Sign in to the app first, then save.")
     last_url = session.page.url if session.page else session.app_url
     # Some apps keep their access token in sessionStorage, which Playwright's storage state leaves out.
@@ -307,7 +308,8 @@ async def finish_capture(capture_id: str, user: Dict = Depends(auth.current_user
     saved = {"storage_state": state, "session_storage": session_storage}
     return vault.put(user["id"], "app_login", session.origin, json.dumps(saved),
                      {"origin": session.origin, "cookie_count": len(cookies), "last_url": last_url,
-                      "session_storage_keys": sum(len(v) for v in session_storage.values())})
+                      "session_storage_keys": sum(len(v) for v in session_storage.values()),
+                      "indexed_db_records": indexed_db_records(state)})
 
 
 @app.delete("/api/app-logins/capture/{capture_id}", response_model=Ok, tags=["app-logins"], summary="Close the sign-in browser without saving",

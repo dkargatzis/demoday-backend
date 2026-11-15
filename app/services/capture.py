@@ -1,8 +1,9 @@
 """Live sign-in capture: a server-side browser the user drives from the dashboard.
 
 The dashboard shows a live JPEG stream of the page and forwards clicks, typing and scrolling. When the user is
-signed in, the browser's storage state (cookies and localStorage) is saved encrypted for that user and app origin.
-Whatever the user types goes straight into their app's page; passwords are never stored.
+signed in, the browser's storage state (cookies, localStorage and IndexedDB, where Firebase Auth and similar SDKs
+keep the signed-in user) is saved encrypted for that user and app origin. Whatever the user types goes straight into
+their app's page; passwords are never stored.
 """
 import asyncio
 import base64
@@ -43,6 +44,22 @@ def unpack_login(blob: bytes) -> Tuple[Dict, Dict]:
     if "cookies" in data or "origins" in data:  # first format: the bare storage state
         return data, {}
     return data.get("storage_state") or {}, data.get("session_storage") or {}
+
+
+def indexed_db_records(storage_state: Dict) -> int:
+    """Records across the IndexedDB snapshot (Firebase Auth keeps the signed-in user in `firebaseLocalStorageDb`)."""
+    return sum(len(store.get("records") or []) for origin in storage_state.get("origins") or []
+               for db in origin.get("indexedDB") or [] for store in db.get("stores") or [])
+
+
+def describe_login(storage_state: Dict, session_storage: Dict) -> str:
+    """'17 cookies, 2 localStorage keys, 1 IndexedDB record, 4 sessionStorage keys' for the job log."""
+    origins = storage_state.get("origins") or []
+    counts = [(len(storage_state.get("cookies") or []), "cookie"),
+              (sum(len(o.get("localStorage") or []) for o in origins), "localStorage key"),
+              (indexed_db_records(storage_state), "IndexedDB record"),
+              (sum(len(v) for v in session_storage.values()), "sessionStorage key")]
+    return ", ".join(f"{n} {label}{'' if n == 1 else 's'}" for n, label in counts if n) or "nothing saved"
 
 
 def session_storage_script(session_storage: Dict) -> str:
@@ -120,7 +137,7 @@ class CaptureManager:
         return session
 
     async def finish(self, session: CaptureSession) -> Tuple[Dict, str]:
-        state = await session.context.storage_state()
+        state = await session.context.storage_state(indexed_db=True)
         last_url = session.page.url if session.page else session.app_url
         await self.close(session)
         return state, last_url

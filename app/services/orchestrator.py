@@ -13,7 +13,7 @@ from app.config import get_secret, storage_root, work_root
 from app.models.schemas import JobStatus, PipelineRequest
 from app.services.audio import synthesize_scene_audio, warm_up_fal
 from app.services.bookends import FAL_VIDEO_MODEL, prepare_bookends
-from app.services.capture import origin_of, unpack_login
+from app.services.capture import describe_login, origin_of, unpack_login
 from app.services.fixtures import FixtureReplayer, get_set_for_origin
 from app.services.ingest import extract_repos_context, probe_app_url
 from app.services.netguard import BlockedURL, ensure_public_url
@@ -57,15 +57,14 @@ def _user_secrets(user_id: Optional[str], req: PipelineRequest, log: Callable[[s
     except vault.VaultUnavailable as exc:
         log(f"Warning: saved credentials are unavailable ({exc}); continuing without them")
         return None, None
-    if state is not None:
-        log(f"Recording signed in with your saved login for {origin}")
-    elif not req.use_app_login:
-        log("Recording signed out: saved login turned off for this run")
-    elif vault.list_kind(user_id, "app_login"):
-        log(f"No saved login for {origin}; recording as a signed-out visitor")
     if state is None:
+        if not req.use_app_login:
+            log("Recording signed out: saved login turned off for this run")
+        elif vault.list_kind(user_id, "app_login"):
+            log(f"No saved login for {origin}; recording as a signed-out visitor")
         return (token.decode() if token else None), None
     storage_state, session_storage = unpack_login(state)
+    log(f"Recording signed in with your saved login for {origin} ({describe_login(storage_state, session_storage)})")
     if session_storage:
         storage_state = dict(storage_state, _session_storage=session_storage)  # carried to the browser contexts
     return (token.decode() if token else None), storage_state

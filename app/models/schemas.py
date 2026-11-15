@@ -137,6 +137,8 @@ class GitHubConnection(SavedSecret):
 class AppLogin(SavedSecret):
     origin: str = Field(..., description="scheme://host[:port] the saved session belongs to")
     cookie_count: int
+    session_storage_keys: int = Field(0, description="sessionStorage items saved from the signed-in tab")
+    indexed_db_records: int = Field(0, description="IndexedDB records saved (Firebase Auth keeps the user there)")
     last_url: Optional[str] = None
 
 
