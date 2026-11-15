@@ -100,9 +100,12 @@ def validate_entries(entries: Any) -> List[Dict]:
 # Analytics, feature flags and error tracking: never worth replaying, and replaying flags can change the app.
 NOISE_URL = re.compile(r"posthog|/flags/?(\?|$)|/decide/?(\?|$)|/e/?\?|segment\.io|sentry|analytics|mixpanel|amplitude|"
                        r"hotjar|intercom|datadog|googletagmanager|google-analytics|/collect\b|/batch\b|/track\b|"
-                       r"launchdarkly|statsig|split\.io|/telemetry|/metrics\b|/events\b", re.IGNORECASE)
-# Session/auth responses are left disabled by default: replaying a stale one signs the app out.
-AUTH_URL = re.compile(r"/auth\b|/session|/login|/logout|/token|/oauth|/whoami|/me/?(\?|$)|/users?/me|/account\b|/csrf",
+                       r"launchdarkly|statsig|split\.io|/telemetry|/metrics\b|/events\b|"
+                       r"firebaseinstallations|firebaselogging|firebase-heartbeat", re.IGNORECASE)
+# Session/auth responses are left disabled by default: replaying a stale one signs the app out. Includes the hosted
+# identity providers' own endpoints (Firebase Auth, Auth0, Clerk) that a signed-in page calls on load.
+AUTH_URL = re.compile(r"/auth\b|/session|/login|/logout|/token|/oauth|/whoami|/me/?(\?|$)|/users?/me|/account\b|/csrf|"
+                      r"identitytoolkit|securetoken|/accounts:|auth0\.com|//clerk\.|\.clerk\.(com|dev|accounts)|/userinfo",
                       re.IGNORECASE)
 
 
