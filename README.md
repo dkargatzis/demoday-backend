@@ -47,7 +47,8 @@ cp .env.example .env
 ```bash
 uvicorn app.main:app --port 8000
 ```
-API documentation is served at `http://localhost:8000/docs`.
+API documentation (Swagger UI) is served at `http://localhost:8000/docs`, ReDoc at `/redoc`, and the OpenAPI spec at
+`/openapi.json`; every operation lists its auth requirement (session cookie), response models and error codes.
 
 Everything except `/api/health` and signup/login requires a signed-in user (HttpOnly session cookie), and jobs,
 videos and saved credentials are only visible to their owner.

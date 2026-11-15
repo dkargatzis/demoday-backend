@@ -15,8 +15,11 @@ import uuid
 from collections import defaultdict, deque
 from typing import Deque, Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, Security
+from fastapi.security import APIKeyCookie
 from pydantic import BaseModel, Field
+
+from app.models.schemas import ErrorDetail, Ok, User
 
 from app import db
 from app.config import env_flag
@@ -29,6 +32,9 @@ ATTEMPT_WINDOW_SEC, MAX_ATTEMPTS = 600, 40
 _attempts: Dict[str, Deque[float]] = defaultdict(deque)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+# Declared as a security scheme so OpenAPI marks protected operations and Swagger UI sends the cookie.
+cookie_scheme = APIKeyCookie(name=COOKIE, auto_error=False, scheme_name="session_cookie",
+                             description="HttpOnly session cookie set by /api/auth/signup or /api/auth/login")
 
 
 class Credentials(BaseModel):
@@ -91,8 +97,8 @@ def user_from_token(token: Optional[str]) -> Optional[Dict]:
     return {"id": row["id"], "email": row["email"]}
 
 
-async def current_user(request: Request) -> Dict:
-    user = user_from_token(request.cookies.get(COOKIE))
+async def current_user(request: Request, token: Optional[str] = Security(cookie_scheme)) -> Dict:
+    user = user_from_token(token or request.cookies.get(COOKIE))
     if user is None:
         raise HTTPException(401, "Sign in to continue")
     return user
@@ -107,7 +113,10 @@ def _start_session(response: Response, user_id: str) -> None:
                         samesite="lax", path="/")
 
 
-@router.post("/signup")
+@router.post("/signup", response_model=User, summary="Create an account and start a session",
+             responses={403: {"model": ErrorDetail, "description": "Signup code missing or wrong"},
+                        409: {"model": ErrorDetail, "description": "Email already registered"},
+                        429: {"model": ErrorDetail, "description": "Too many attempts"}})
 async def signup(body: Credentials, request: Request, response: Response):
     _rate_limit(request)
     required = os.getenv("SIGNUP_CODE", "").strip()
@@ -127,7 +136,8 @@ async def signup(body: Credentials, request: Request, response: Response):
     return {"id": user_id, "email": email}
 
 
-@router.post("/login")
+@router.post("/login", response_model=User, summary="Sign in (sets the session cookie)",
+             responses={401: {"model": ErrorDetail}, 429: {"model": ErrorDetail}})
 async def login(body: Credentials, request: Request, response: Response):
     _rate_limit(request)
     row = db.one("SELECT id, email, password_hash FROM users WHERE email = ?", (body.email.strip().lower(),))
@@ -138,7 +148,7 @@ async def login(body: Credentials, request: Request, response: Response):
     return {"id": row["id"], "email": row["email"]}
 
 
-@router.post("/logout")
+@router.post("/logout", response_model=Ok, summary="End the session")
 async def logout(request: Request, response: Response):
     token = request.cookies.get(COOKIE)
     if token:
@@ -147,6 +157,6 @@ async def logout(request: Request, response: Response):
     return {"ok": True}
 
 
-@router.get("/me")
+@router.get("/me", response_model=User, summary="The signed-in user", responses={401: {"model": ErrorDetail}})
 async def me(user: Dict = Depends(current_user)):
     return user

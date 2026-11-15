@@ -1,4 +1,4 @@
-from typing import List, Literal, Optional
+from typing import Any, List, Literal, Optional
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -92,3 +92,91 @@ class JobStatus(BaseModel):
     launch_kit: Optional[LaunchKit] = None
     video_url: Optional[str] = None
     error: Optional[str] = None
+
+
+# --------------------------------------------------------------------------- API response models
+
+
+class Ok(BaseModel):
+    ok: bool = True
+
+
+class ErrorDetail(BaseModel):
+    detail: str = Field(..., examples=["Sign in to continue"])
+
+
+class HealthStatus(BaseModel):
+    status: Literal["ok"]
+    service: str
+    ffmpeg: bool = Field(..., description="ffmpeg and ffprobe found on PATH")
+    gemini: bool = Field(..., description="GEMINI_API_KEY configured (otherwise template storyboard/launch kit)")
+    fal: bool = Field(..., description="FAL_KEY configured (otherwise Google Cloud TTS, then local TTS)")
+    gemini_model: str
+    vault: bool = Field(..., description="DEMODAY_SECRET_KEY configured, so credentials can be saved")
+    signup_code: bool = Field(..., description="Creating an account requires the signup code")
+
+
+class User(BaseModel):
+    id: str
+    email: str
+
+
+class SavedSecret(BaseModel):
+    id: str
+    kind: str
+    name: str
+    created_at: float = Field(..., description="Unix timestamp")
+
+
+class GitHubConnection(SavedSecret):
+    login: str = Field(..., description="GitHub login the token belongs to")
+    token_type: Literal["classic", "fine-grained"]
+    scopes: str = Field("", description="Classic token scopes; empty for fine-grained tokens")
+
+
+class AppLogin(SavedSecret):
+    origin: str = Field(..., description="scheme://host[:port] the saved session belongs to")
+    cookie_count: int
+    last_url: Optional[str] = None
+
+
+class SettingsOut(BaseModel):
+    vault: bool
+    github: Optional[GitHubConnection] = None
+    app_logins: List[AppLogin] = []
+
+
+class CaptureStart(BaseModel):
+    capture_id: str
+    origin: str
+    viewport: dict = Field(..., examples=[{"width": 1280, "height": 800}])
+
+
+class ShareLink(BaseModel):
+    url: str
+    expires_at: Optional[float] = Field(None, description="Unix timestamp, or null when the link does not expire")
+
+
+class FixtureEntry(BaseModel):
+    url: str
+    method: str = "GET"
+    status: int = 200
+    body: Any = Field(..., description="The JSON response to replay")
+    post_data: Optional[str] = None
+    enabled: bool = True
+    source: str = Field("captured", description="captured, edited, or gemini (<model>)")
+
+
+class FixtureSetSummary(BaseModel):
+    id: str
+    origin: str
+    polished: bool
+    brief: str = ""
+    updated_at: float
+    entry_count: int
+    enabled_count: int
+
+
+class FixtureSet(FixtureSetSummary):
+    entries: List[FixtureEntry] = []
+    note: Optional[str] = Field(None, description="Set by /polish: what Gemini changed")

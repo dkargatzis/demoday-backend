@@ -15,7 +15,8 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.config import BACKEND_ROOT, GEMINI_MODEL, GITHUB_API_URL, capabilities, storage_root  # loads .env first
 from app import auth, db, vault
-from app.models.schemas import JobStatus, PipelineRequest, _http_url
+from app.models.schemas import (AppLogin, CaptureStart, ErrorDetail, FixtureSet, FixtureSetSummary, GitHubConnection,
+                                HealthStatus, JobStatus, Ok, PipelineRequest, SettingsOut, ShareLink, _http_url)
 from app.services import cloud, fixtures
 from app.services.capture import CAPTURES, origin_of
 from app.services.capture import VIEWPORT as CAPTURE_VIEWPORT
@@ -50,11 +51,41 @@ async def lifespan(_: FastAPI):
     db.flush_backup()  # the last writes reach the bucket before the instance goes away
 
 
+API_DESCRIPTION = """
+Autonomous demo videos and launch kits: give it a GitHub repository (or several) and a live app URL, and it plans a
+storyboard with Gemini, narrates it (fal.ai Kokoro, Google Cloud Text-to-Speech or a local voice), records the real
+app in headless Chromium, assembles a 1080p MP4 with FFmpeg, and writes the README, Devpost pitch and launch posts.
+
+**Authentication.** Every endpoint except `/api/health`, `/api/auth/signup` and `/api/auth/login` needs the
+`demoday_session` cookie (HttpOnly, `SameSite=Lax`) that signup and login set. Creating an account requires the
+server's signup code when one is configured. Jobs, videos, saved logins and sample data are only visible to their
+owner.
+
+**Live updates.** `GET /api/pipeline/events/{job_id}` is a Server-Sent Events stream: every `data:` message is a full
+`JobStatus` snapshot, the server sends `: keep-alive` comments, and the stream ends after the job reaches
+`completed` or `failed`. `GET /api/pipeline/status/{job_id}` returns the same snapshot on demand.
+
+**Sign-in capture.** `POST /api/app-logins/capture` opens a server-side browser; the dashboard drives it over the
+WebSocket `/api/app-logins/capture/{capture_id}/ws` (binary frames are JPEG screencast frames; JSON text messages
+`{"type": "status"|"notice"|"closed"}` flow out, and `{"type": "click"|"text"|"key"|"wheel"|"back"|"navigate"}`
+flow in). WebSockets are not part of OpenAPI, so that endpoint is only described here.
+"""
+
+OPENAPI_TAGS = [
+    {"name": "health", "description": "Service status and which providers are configured."},
+    {"name": "auth", "description": "Accounts and the session cookie."},
+    {"name": "pipeline", "description": "Start a demo job, follow it live, fetch the video."},
+    {"name": "settings", "description": "Per-user GitHub token for private repositories."},
+    {"name": "app-logins", "description": "Saved sign-in sessions so demos can record pages behind a login."},
+    {"name": "fixtures", "description": "Staged sample data: captured API responses, polished by Gemini, replayed while recording."},
+]
+
 app = FastAPI(
     title="DemoDay Launch Kit Engine",
-    description="Autonomous browser recording, fal.ai voiceover, and pitch generation",
-    version="1.2.0",
+    description=API_DESCRIPTION,
+    version="1.3.0",
     lifespan=lifespan,
+    openapi_tags=OPENAPI_TAGS,
 )
 app.add_middleware(
     CORSMiddleware,
@@ -66,12 +97,15 @@ app.add_middleware(
 app.include_router(auth.router)
 
 
-@app.get("/api/health")
+@app.get("/api/health", response_model=HealthStatus, tags=["health"], summary="Service status and capabilities")
 async def health():
     return {"status": "ok", "service": "demoday-backend", **capabilities()}
 
 
-@app.post("/api/pipeline/share/{job_id}")
+@app.post("/api/pipeline/share/{job_id}", response_model=ShareLink, tags=["pipeline"],
+          summary="A link to the finished video that works without signing in",
+          responses={401: {"model": ErrorDetail}, 404: {"model": ErrorDetail},
+                     503: {"model": ErrorDetail, "description": "Share links are not enabled on this server"}})
 async def share_video(job_id: str, user: Dict = Depends(auth.current_user)):
     """A link to the finished video that works without signing in (a copy in the public share bucket)."""
     job = _job_for(job_id, user)
@@ -103,24 +137,36 @@ def _job_for(job_id: str, user: Dict) -> JobStatus:
     return job
 
 
-@app.post("/api/pipeline/start", response_model=JobStatus)
+@app.post("/api/pipeline/start", response_model=JobStatus, tags=["pipeline"], summary="Start a demo job",
+          responses={401: {"model": ErrorDetail}, 422: {"description": "Invalid request (e.g. a non-http URL)"}})
 async def start_pipeline(req: PipelineRequest, user: Dict = Depends(auth.current_user)):
     return create_pipeline_job(req, user_id=user["id"])
 
 
-@app.get("/api/pipeline/status/{job_id}", response_model=JobStatus)
+@app.get("/api/pipeline/status/{job_id}", response_model=JobStatus, tags=["pipeline"], summary="Current job snapshot",
+         responses={401: {"model": ErrorDetail}, 404: {"model": ErrorDetail, "description": "Not your job, or lost in a server restart"}})
 async def get_status(job_id: str, user: Dict = Depends(auth.current_user)):
     return _job_for(job_id, user)
 
 
-@app.get("/api/pipeline/events/{job_id}")
+@app.get("/api/pipeline/events/{job_id}", tags=["pipeline"], summary="Live job updates (Server-Sent Events)",
+         response_class=StreamingResponse,
+         responses={200: {"description": "text/event-stream: each `data:` line is a full JobStatus JSON snapshot; "
+                                         "ends after the job completes or fails",
+                          "content": {"text/event-stream": {"schema": {"type": "string",
+                                      "example": "retry: 3000\n\ndata: {\"job_id\": \"...\", \"status\": \"running\", ...}\n\n"}}}},
+                    401: {"model": ErrorDetail}, 404: {"model": ErrorDetail}})
 @app.get("/api/pipeline/stream/{job_id}", include_in_schema=False)  # backwards-compatible alias
 async def stream_events(job_id: str, user: Dict = Depends(auth.current_user)):
     _job_for(job_id, user)
     return StreamingResponse(stream_job_events(job_id), media_type="text/event-stream", headers=SSE_HEADERS)
 
 
-@app.get("/api/pipeline/video/{job_id}")
+@app.get("/api/pipeline/video/{job_id}", tags=["pipeline"], summary="The finished MP4 (supports Range requests)",
+         response_class=FileResponse,
+         responses={200: {"description": "video/mp4; inline, or an attachment with ?download=1",
+                          "content": {"video/mp4": {"schema": {"type": "string", "format": "binary"}}}},
+                    401: {"model": ErrorDetail}, 404: {"model": ErrorDetail}})
 async def get_video(job_id: str, download: bool = False, user: Dict = Depends(auth.current_user)):
     _job_for(job_id, user)
     video_path = storage_root() / job_id / "demo.mp4"
@@ -146,7 +192,8 @@ class GitHubTokenIn(BaseModel):
     token: str = Field(..., min_length=20, max_length=255)
 
 
-@app.get("/api/settings")
+@app.get("/api/settings", response_model=SettingsOut, tags=["settings"], summary="Saved credentials (metadata only)",
+         responses={401: {"model": ErrorDetail}})
 async def get_settings(user: Dict = Depends(auth.current_user)):
     return {
         "vault": vault.available(),
@@ -155,7 +202,10 @@ async def get_settings(user: Dict = Depends(auth.current_user)):
     }
 
 
-@app.put("/api/settings/github-token")
+@app.put("/api/settings/github-token", response_model=GitHubConnection, tags=["settings"],
+         summary="Save a GitHub token (checked with GitHub, stored encrypted)",
+         responses={400: {"model": ErrorDetail, "description": "GitHub rejected the token"},
+                    401: {"model": ErrorDetail}, 502: {"model": ErrorDetail}, 503: {"model": ErrorDetail}})
 async def save_github_token(body: GitHubTokenIn, user: Dict = Depends(auth.current_user)):
     _require_vault()
     token = body.token.strip()
@@ -178,7 +228,8 @@ async def save_github_token(body: GitHubTokenIn, user: Dict = Depends(auth.curre
     })
 
 
-@app.delete("/api/settings/github-token")
+@app.delete("/api/settings/github-token", response_model=Ok, tags=["settings"], summary="Remove the GitHub token",
+            responses={401: {"model": ErrorDetail}})
 async def delete_github_token(user: Dict = Depends(auth.current_user)):
     vault.delete(user["id"], "github_token", name="default")
     return {"ok": True}
@@ -196,19 +247,27 @@ class CaptureStartIn(BaseModel):
         return _http_url(value)
 
 
-@app.get("/api/app-logins")
+@app.get("/api/app-logins", response_model=list[AppLogin], tags=["app-logins"], summary="Saved app logins",
+         responses={401: {"model": ErrorDetail}})
 async def list_app_logins(user: Dict = Depends(auth.current_user)):
     return vault.list_kind(user["id"], "app_login")
 
 
-@app.delete("/api/app-logins/{login_id}")
+@app.delete("/api/app-logins/{login_id}", response_model=Ok, tags=["app-logins"], summary="Remove a saved login",
+            responses={401: {"model": ErrorDetail}, 404: {"model": ErrorDetail}})
 async def delete_app_login(login_id: str, user: Dict = Depends(auth.current_user)):
     if not vault.delete(user["id"], "app_login", secret_id=login_id):
         raise HTTPException(404, "Saved login not found")
     return {"ok": True}
 
 
-@app.post("/api/app-logins/capture")
+@app.post("/api/app-logins/capture", response_model=CaptureStart, tags=["app-logins"],
+          summary="Open a server-side browser to sign in to an app",
+          description="Returns a capture id; drive the browser over the WebSocket "
+                      "`/api/app-logins/capture/{capture_id}/ws` (see the API overview), then call `/finish` to save "
+                      "the session. The browser closes after 5 idle minutes or 15 minutes in total.",
+          responses={400: {"model": ErrorDetail, "description": "Private-network URL refused"},
+                     401: {"model": ErrorDetail}, 503: {"model": ErrorDetail}})
 async def start_capture(body: CaptureStartIn, user: Dict = Depends(auth.current_user)):
     _require_vault()
     try:
@@ -221,7 +280,10 @@ async def start_capture(body: CaptureStartIn, user: Dict = Depends(auth.current_
     return {"capture_id": session.id, "origin": session.origin, "viewport": CAPTURE_VIEWPORT}
 
 
-@app.post("/api/app-logins/capture/{capture_id}/finish")
+@app.post("/api/app-logins/capture/{capture_id}/finish", response_model=AppLogin, tags=["app-logins"],
+          summary="Save the signed-in session (cookies and local storage, encrypted)",
+          responses={400: {"model": ErrorDetail, "description": "No session yet: sign in first"},
+                     401: {"model": ErrorDetail}, 404: {"model": ErrorDetail}})
 async def finish_capture(capture_id: str, user: Dict = Depends(auth.current_user)):
     session = CAPTURES.get(capture_id, user["id"])
     if session is None:
@@ -237,7 +299,8 @@ async def finish_capture(capture_id: str, user: Dict = Depends(auth.current_user
                      {"origin": session.origin, "cookie_count": len(cookies), "last_url": last_url})
 
 
-@app.delete("/api/app-logins/capture/{capture_id}")
+@app.delete("/api/app-logins/capture/{capture_id}", response_model=Ok, tags=["app-logins"], summary="Close the sign-in browser without saving",
+            responses={401: {"model": ErrorDetail}})
 async def cancel_capture(capture_id: str, user: Dict = Depends(auth.current_user)):
     session = CAPTURES.get(capture_id, user["id"])
     if session is not None:
@@ -315,15 +378,17 @@ class FixturePolishIn(BaseModel):
 
 
 class FixtureUpdateIn(BaseModel):
-    entries: list
+    entries: list = Field(..., description="Full list of FixtureEntry objects; `body` may be an object or a JSON string")
 
 
-@app.get("/api/fixtures")
+@app.get("/api/fixtures", response_model=list[FixtureSetSummary], tags=["fixtures"], summary="Staged data sets (one per app origin)",
+         responses={401: {"model": ErrorDetail}})
 async def list_fixtures(user: Dict = Depends(auth.current_user)):
     return fixtures.list_sets(user["id"])
 
 
-@app.get("/api/fixtures/{set_id}")
+@app.get("/api/fixtures/{set_id}", response_model=FixtureSet, tags=["fixtures"], summary="A staged data set with its entries",
+         responses={401: {"model": ErrorDetail}, 404: {"model": ErrorDetail}})
 async def get_fixture(set_id: str, user: Dict = Depends(auth.current_user)):
     found = fixtures.get_set(user["id"], set_id)
     if found is None:
@@ -331,7 +396,11 @@ async def get_fixture(set_id: str, user: Dict = Depends(auth.current_user)):
     return found
 
 
-@app.post("/api/fixtures/capture")
+@app.post("/api/fixtures/capture", response_model=FixtureSet, tags=["fixtures"],
+          summary="Capture the JSON API responses of an app (signed in when a login is saved)",
+          responses={400: {"model": ErrorDetail}, 401: {"model": ErrorDetail},
+                     422: {"model": ErrorDetail, "description": "The pages made no JSON API calls"},
+                     502: {"model": ErrorDetail, "description": "The app could not be loaded"}})
 async def capture_fixture(body: FixtureCaptureIn, user: Dict = Depends(auth.current_user)):
     """Loads the app (signed in when a login is saved) and records its JSON API responses as a new set."""
     from app.services.recorder import declutter_page, settle_page
@@ -359,7 +428,9 @@ async def capture_fixture(body: FixtureCaptureIn, user: Dict = Depends(auth.curr
     return fixtures.save_set(user["id"], origin, entries, polished=False)
 
 
-@app.post("/api/fixtures/{set_id}/polish")
+@app.post("/api/fixtures/{set_id}/polish", response_model=FixtureSet, tags=["fixtures"],
+          summary="Rewrite the set as rich sample data with Gemini (same schema)",
+          responses={401: {"model": ErrorDetail}, 404: {"model": ErrorDetail}, 502: {"model": ErrorDetail}})
 async def polish_fixture(set_id: str, body: FixturePolishIn, user: Dict = Depends(auth.current_user)):
     found = fixtures.get_set(user["id"], set_id)
     if found is None:
@@ -372,7 +443,8 @@ async def polish_fixture(set_id: str, body: FixturePolishIn, user: Dict = Depend
     return {**saved, "note": note}
 
 
-@app.put("/api/fixtures/{set_id}")
+@app.put("/api/fixtures/{set_id}", response_model=FixtureSet, tags=["fixtures"], summary="Replace the entries (JSON-validated)",
+         responses={401: {"model": ErrorDetail}, 404: {"model": ErrorDetail}, 422: {"model": ErrorDetail}})
 async def update_fixture(set_id: str, body: FixtureUpdateIn, user: Dict = Depends(auth.current_user)):
     found = fixtures.get_set(user["id"], set_id)
     if found is None:
@@ -384,7 +456,8 @@ async def update_fixture(set_id: str, body: FixtureUpdateIn, user: Dict = Depend
         raise HTTPException(422, str(exc))
 
 
-@app.delete("/api/fixtures/{set_id}")
+@app.delete("/api/fixtures/{set_id}", response_model=Ok, tags=["fixtures"], summary="Remove a staged data set",
+            responses={401: {"model": ErrorDetail}, 404: {"model": ErrorDetail}})
 async def delete_fixture(set_id: str, user: Dict = Depends(auth.current_user)):
     if not fixtures.delete_set(user["id"], set_id):
         raise HTTPException(404, "Sample data set not found")
