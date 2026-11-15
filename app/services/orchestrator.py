@@ -17,7 +17,7 @@ from app.services import funnels as funnels_mod
 from app.services import ledger, music, plancheck, rehearsal, review, vision
 from app.models.schemas import JobStatus, PipelineRequest, StepState, Storyboard
 from app.services import audience
-from app.services.audio import synthesize_scene_audio, warm_up_fal
+from app.services.audio import bind_job_voice, synthesize_narration, voice_tool, warm_up_fal
 from app.services.bookends import (FAL_IMAGE_MODEL, FAL_VIDEO_MODEL, POSTER_HEIGHT, POSTER_WIDTH, prepare_bookends,
                                    prepare_poster)
 from app.services.capture import describe_login, origin_of, unpack_login
@@ -231,6 +231,7 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
                             script: Optional[Dict[str, Any]] = None) -> None:
     job = JOBS[job_id]
     ledger.bind(job)  # first: every task created from here on inherits the ledger target
+    bind_job_voice()  # and the job's voice: the intro, the scenes and the outro are voiced by one engine
     events = EVENTS.get(job_id) or EVENTS.setdefault(job_id, JobEvents())
     log = _job_logger(job, events)
     started = time.monotonic()
@@ -556,10 +557,8 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
         step("narration", "running", detail=f"{len(scenes)} scenes")
         log(f"Synthesizing narration for {len(scenes)} scenes...")
         audio_paths = [job_dir / f"scene_{i + 1:02d}.wav" for i in range(len(scenes))]
-        narrations = await asyncio.gather(*(
-            synthesize_scene_audio(scene.narration, path, req.voice_style)
-            for scene, path in zip(scenes, audio_paths)
-        ))
+        narrations = await synthesize_narration([scene.narration for scene in scenes], audio_paths, req.voice_style)
+        narration_tool = voice_tool([engine for _, engine in narrations])
         for i, (scene, (duration, engine)) in enumerate(zip(scenes, narrations)):
             scene.duration_sec = round(duration, 3)
             log(f"Scene {i + 1}/{len(scenes)}: {duration:.2f}s of narration via {engine}")
@@ -574,7 +573,8 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
                 replayer.hits = 0  # the recording reports its own sample-data hits
         retimed = fit_dwells(scenes, clip_durations, log)  # dwells re-timed to the measured voice; never raises
         step("narration", "done", detail=f"{sum(d for d, _ in narrations):.1f}s across {len(scenes)} scenes"
-             + (f" · {retimed} scene{'' if retimed == 1 else 's'} re-timed to the voice" if retimed else ""))
+             + (f" · {retimed} scene{'' if retimed == 1 else 's'} re-timed to the voice" if retimed else ""),
+             tool=narration_tool if narration_tool in ("fal", "gemini") else None)
         job.progress = 45
 
         # 4. Record + encode
