@@ -6,15 +6,13 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-from google import genai
-from google.genai import types
 
+from app.services.gemini import GEMINI_TIMEOUT_SEC, generate_json  # noqa: F401 (re-exported)
 from app.config import GEMINI_MODEL, get_secret
 from app.models.schemas import Action, LaunchKit, Scene, Storyboard
 
 logger = logging.getLogger("demoday.planner")
 
-GEMINI_TIMEOUT_SEC = 90
 # Spoken words per second per voice preset (audio.VOICE_PRESETS), measured on real Gemini narration read by
 # fal.ai Kokoro: sentence breaks and product names make it slower than plain prose. Erring low keeps videos
 # at or under the requested length.
@@ -32,35 +30,9 @@ TONES = {
 # --------------------------------------------------------------------------- Gemini plumbing
 
 
-async def _generate_json(prompt: str, deep: bool = False) -> Any:
-    """`deep` asks the model for its highest thinking level (the storyboard deserves the extra seconds)."""
-    key = get_secret("GEMINI_API_KEY")
-    if not key:
-        raise RuntimeError("GEMINI_API_KEY not configured")
-    client = genai.Client(api_key=key, http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_SEC * 1000))
-    configs = [types.GenerateContentConfig(response_mime_type="application/json")]
-    if deep:
-        configs.insert(0, types.GenerateContentConfig(response_mime_type="application/json",
-                                                      thinking_config=types.ThinkingConfig(thinking_level="high")))
-    try:
-        for config in configs:
-            try:
-                response = await asyncio.wait_for(
-                    client.aio.models.generate_content(model=GEMINI_MODEL, contents=prompt, config=config),
-                    timeout=GEMINI_TIMEOUT_SEC + 10,
-                )
-                break
-            except Exception as exc:  # a model without thinking levels: fall back to the plain call
-                if config is configs[-1] or "thinking" not in str(exc).lower():
-                    raise
-    finally:
-        await client.aio.aclose()
-    text = (response.text or "").strip()
-    if not text:
-        raise ValueError("Gemini returned an empty response")
-    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)  # tolerate fenced output
-    # strict=False accepts raw newlines/tabs inside string values, which Gemini sometimes emits in long Markdown fields.
-    return json.loads(text, strict=False)
+async def _generate_json(prompt: str, deep: bool = False, purpose: str = "gemini") -> Any:
+    """Kept for callers that import it by name (fixtures); the implementation lives in gemini.py."""
+    return await generate_json(prompt, deep=deep, purpose=purpose)
 
 
 def _failure_reason(exc: Exception) -> str:
@@ -262,7 +234,7 @@ RULES
 """
     if get_secret("GEMINI_API_KEY"):
         try:
-            storyboard = _sanitize_storyboard(await _generate_json(prompt, deep=True), name)
+            storyboard = _sanitize_storyboard(await _generate_json(prompt, deep=True, purpose="plan storyboard"), name)
             return storyboard, f"Storyboard planned by Gemini ({GEMINI_MODEL}, thinking level high)"
         except Exception as exc:
             logger.warning("Gemini storyboard failed: %s", exc)
@@ -386,7 +358,7 @@ Return JSON with exactly these keys:
 """
     if get_secret("GEMINI_API_KEY"):
         try:
-            return _sanitize_launch_kit(await _generate_json(prompt)), f"Launch kit written by Gemini ({GEMINI_MODEL})"
+            return _sanitize_launch_kit(await _generate_json(prompt, purpose="launch kit")), f"Launch kit written by Gemini ({GEMINI_MODEL})"
         except Exception as exc:
             logger.warning("Gemini launch kit failed: %s", exc)
             reason = f"Gemini ({GEMINI_MODEL}) failed: {_failure_reason(exc)}"

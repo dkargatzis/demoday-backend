@@ -23,6 +23,14 @@ def env_flag(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def feature_on(name: str, default: bool = True) -> bool:
+    """FEATURE_<NAME> switches for the optional agent steps (unset -> `default`; 0/false/no/off -> False)."""
+    value = os.getenv(f"FEATURE_{name.upper()}", "").strip().lower()
+    if not value:
+        return default
+    return value not in ("0", "false", "no", "off")
+
+
 def get_secret(name: str) -> str:
     """Returns a secret from the environment, treating unset or template placeholder values as missing."""
     value = os.getenv(name, "").strip()

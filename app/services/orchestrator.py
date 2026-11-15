@@ -10,7 +10,8 @@ from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Set, Tup
 
 from app import db, vault
 from app.config import capabilities, get_secret, storage_root, work_root
-from app.models.schemas import JobStatus, PipelineRequest
+from app.services import ledger
+from app.models.schemas import JobStatus, PipelineRequest, StepState
 from app.services.audio import synthesize_scene_audio, warm_up_fal
 from app.services.bookends import FAL_VIDEO_MODEL, prepare_bookends
 from app.services.capture import describe_login, origin_of, unpack_login
@@ -31,9 +32,16 @@ SCENE_TAIL_SEC = 0.4  # breathing room after each narration line
 BOOKEND_VOICE_DELAY_SEC = 0.4  # the intro/outro line starts after the title fades in
 TERMINAL = ("completed", "failed")
 STEP_LABELS = {
-    "repos": "Reading the repositories", "scrape": "Reading the live app", "storyboard": "Planning the storyboard",
-    "launchpack": "Writing the launch kit", "ai_clips": "AI intro and outro", "narration": "Synthesizing narration",
-    "record": "Recording the browser session", "video": "Assembling demo.mp4",
+    "repos": "Reading the repositories", "scrape": "Exploring the live app", "audience": "Researching the customer",
+    "understand": "Understanding the pages", "storyboard": "Planning the storyboard", "plancheck": "Checking the plan",
+    "launchpack": "Writing the launch kit", "ai_clips": "AI intro and outro", "cover": "Painting the cover art",
+    "music": "Composing the soundtrack", "narration": "Synthesizing narration", "record": "Recording the browser session",
+    "review": "Reviewing the footage", "retake": "Retaking a scene", "video": "Assembling demo.mp4",
+}
+STEP_TOOLS = {
+    "repos": "github", "scrape": "chromium", "audience": "gemini", "understand": "gemini", "storyboard": "gemini",
+    "plancheck": "gemini", "launchpack": "gemini", "ai_clips": "fal", "cover": "fal", "music": "fal", "narration": "fal",
+    "record": "chromium", "review": "gemini", "retake": "chromium", "video": "ffmpeg",
 }
 
 
@@ -65,26 +73,64 @@ class JobEvents:
 
 
 class _Steps:
-    """Emits `step` events and remembers which steps are still running, so a failure can mark them."""
+    """Keeps the agent trace (`job.steps`, one row per step) and emits `step` events with the tool and elapsed time.
 
-    def __init__(self, events: JobEvents) -> None:
-        self.events, self.running = events, []  # type: JobEvents, List[str]
+    `extra` (thumbnails, verdicts) travels only in the one-off event, never in the JobStatus snapshot.
+    """
 
-    def __call__(self, step_id: str, status: str, detail: Optional[str] = None, message: Optional[str] = None) -> None:
+    def __init__(self, events: JobEvents, job: Optional[JobStatus] = None, t0: Optional[float] = None) -> None:
+        self.events, self.job, self.t0 = events, job, t0 if t0 is not None else time.monotonic()
+        self.running: List[str] = []
+
+    def __call__(self, step_id: str, status: str, detail: Optional[str] = None, message: Optional[str] = None,
+                 extra: Optional[Dict[str, Any]] = None) -> None:
         if status == "running":
             self.running.append(step_id)
         else:
             self.running = [s for s in self.running if s != step_id]
-        data: Dict[str, Any] = {"id": step_id, "status": status, "label": STEP_LABELS.get(step_id, step_id)}
+        label, tool = STEP_LABELS.get(step_id, step_id), STEP_TOOLS.get(step_id)
+        self._upsert(step_id, status, label, tool, detail, message)
+        data: Dict[str, Any] = {"id": step_id, "status": status, "label": label, "tool": tool,
+                                "t": round(time.monotonic() - self.t0, 1)}
         if detail:
             data["detail"] = detail
         if message:
             data["message"] = message
+        if extra:
+            data["extra"] = extra
         self.events.emit("step", data)
+
+    def note(self, step_id: str, detail: str) -> None:
+        """Updates a running row's detail (live counters) without emitting an event."""
+        for row in (self.job.steps if self.job else []):
+            if row.id == step_id:
+                row.detail = detail
+                return
 
     def fail(self, message: str) -> None:
         for step_id in list(self.running):
             self(step_id, "error", message=message)
+
+    def _upsert(self, step_id: str, status: str, label: str, tool: Optional[str], detail: Optional[str],
+                message: Optional[str]) -> None:
+        if self.job is None:
+            return
+        now = time.time()
+        row = next((r for r in self.job.steps if r.id == step_id), None)
+        if row is None:
+            row = StepState(id=step_id, status=status, label=label, tool=tool)
+            self.job.steps.append(row)
+        row.status, row.label, row.tool = status, label, tool
+        if detail:
+            row.detail = detail
+        if message:
+            row.message = message
+        if status == "running":
+            row.started_at = row.started_at or now
+            row.ended_at = None
+        else:
+            row.started_at = row.started_at or now
+            row.ended_at = now
 
 
 EVENTS: Dict[str, JobEvents] = {}
@@ -157,14 +203,29 @@ def _user_secrets(user_id: Optional[str], req: PipelineRequest, log: Callable[[s
 
 async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional[str] = None) -> None:
     job = JOBS[job_id]
+    ledger.bind(job)  # first: every task created from here on inherits the ledger target
     events = EVENTS.get(job_id) or EVENTS.setdefault(job_id, JobEvents())
     log = _job_logger(job, events)
-    step = _Steps(events)
+    started = time.monotonic()
+    step = _Steps(events, job, started)
     job.status = "running"
     kit_task: Optional[asyncio.Task] = None
     bookend_task: Optional[asyncio.Task] = None
+    background: List[asyncio.Task] = []  # optional work (warm-up, cover, music, review): cancelled before completion
     job_dir: Optional[Path] = None
-    started = time.monotonic()
+
+    async def _optional(awaitable, timeout: float, step_id: str, what: str):
+        """Runs an optional agent step with a hard timeout; a failure costs one log line and never the demo."""
+        try:
+            return await asyncio.wait_for(awaitable, timeout)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # noqa: BLE001 - optional steps must never take the job down
+            reason = "took too long" if isinstance(exc, asyncio.TimeoutError) else (str(exc).strip().splitlines() or [type(exc).__name__])[0]
+            logger.warning("[%s] %s skipped: %s", job_id, what, reason, exc_info=not isinstance(exc, asyncio.TimeoutError))
+            log(f"{what} skipped: {reason[:140]}")
+            step(step_id, "error", message=reason[:140])
+            return None
 
     try:  # everything, including setup, must land in a terminal state or the job hangs in "running"
         job_dir = work_root() / job_id  # intermediates; the results are copied to storage_root()/job_id
@@ -177,6 +238,7 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
         warm_task = asyncio.create_task(warm_up_fal())  # fal.ai's queue warms up while we ingest and plan
         _TASKS.add(warm_task)
         warm_task.add_done_callback(_TASKS.discard)
+        background.append(warm_task)
         replayer = None
         if user_id and req.use_staged_data:
             fixture_set = get_set_for_origin(user_id, origin_of(req.app_url))
@@ -356,16 +418,22 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
         step("launchpack", "done", detail=kit_note)
 
         job.stage, job.progress = "completed", 100
+        for pending in background:  # stragglers must not touch the job after it is done
+            if not pending.done():
+                pending.cancel()
+        ledger.seal(job)
+        log("Tools used: " + ledger.summary(job))
         log(f"Pipeline completed in {time.monotonic() - started:.0f}s: demo.mp4 and launch kit ready.")
         job.status = "completed"
     except Exception as exc:
         logger.exception("[%s] pipeline failed", job_id)
-        for pending in (kit_task, bookend_task):
+        for pending in (kit_task, bookend_task, *background):
             if pending and not pending.done():
                 pending.cancel()
         job.error = str(exc).strip() or type(exc).__name__
         log(f"Pipeline failed: {job.error}")
         step.fail(job.error)
+        ledger.seal(job)
         job.status = "failed"
 
     if job_dir is not None:  # storyboard, launch kit and logs next to the media, for debugging and re-download

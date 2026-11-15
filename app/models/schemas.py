@@ -93,6 +93,9 @@ class Scene(BaseModel):
     duration_sec: float = 0.0
     video_path: Optional[str] = None
     audio_path: Optional[str] = None
+    why: Optional[str] = Field(default=None, description="The planner's one line on why this scene is in the tour")
+    verdict: Optional[str] = Field(default=None, description="The footage review's verdict for this scene")
+    seen: Optional[str] = Field(default=None, description="What the reviewer saw on screen in this scene")
 
 
 class Storyboard(BaseModel):
@@ -104,6 +107,11 @@ class Storyboard(BaseModel):
     outro_sec: float = 0.0
     intro_visual: Optional[str] = None  # Gemini's shot descriptions for the AI clips
     outro_visual: Optional[str] = None
+    plan_rationale: Optional[str] = Field(default=None, description="Why these pages in this order (one sentence)")
+    music_prompt: Optional[str] = Field(default=None, description="Gemini's brief for the fal.ai soundtrack")
+    cover_visual: Optional[str] = Field(default=None, description="Gemini's brief for the fal.ai cover art")
+    soundtrack: Optional[str] = Field(default=None, description="How the soundtrack was made, or why it was skipped")
+    cover: Optional[str] = Field(default=None, description="How the cover art was made, or why it was skipped")
 
 
 class LaunchKit(BaseModel):
@@ -111,6 +119,30 @@ class LaunchKit(BaseModel):
     devpost_pitch: str
     x_thread: List[str]
     linkedin_post: str
+
+
+class StepState(BaseModel):
+    """One row of the agent trace: a pipeline step and the tool behind it (timestamps, never ticking counters)."""
+    id: str
+    status: Literal["running", "done", "skipped", "error"]
+    label: str
+    tool: Optional[str] = Field(default=None, description="gemini, fal, chromium, ffmpeg or github")
+    detail: Optional[str] = None
+    message: Optional[str] = None
+    started_at: Optional[float] = None
+    ended_at: Optional[float] = None
+
+
+class ToolCall(BaseModel):
+    """One Gemini or fal.ai call the job made (the ledger)."""
+    tool: Literal["gemini", "fal"]
+    purpose: str
+    model: str
+    started_at: float
+    ended_at: Optional[float] = None
+    ms: Optional[int] = None
+    ok: Optional[bool] = None
+    note: str = ""
 
 
 class JobStatus(BaseModel):
@@ -127,6 +159,8 @@ class JobStatus(BaseModel):
     created_at: Optional[float] = Field(default=None, description="Unix time the job was accepted")
     options: Dict[str, Any] = Field(default_factory=dict,
                                     description="Request options echoed for the kit contract: goals, requestedLanguage")
+    steps: List[StepState] = Field(default_factory=list, description="The agent trace, one row per pipeline step")
+    tool_calls: List[ToolCall] = Field(default_factory=list, description="Every Gemini and fal.ai call, with latency")
 
 
 class JobStarted(JobStatus):

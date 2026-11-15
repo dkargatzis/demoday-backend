@@ -315,7 +315,7 @@ Include every endpoint below, with the same method and url.
 ENDPOINTS
 {json.dumps(shown, ensure_ascii=False, indent=1)}
 """
-    data = await _generate_json(prompt)
+    data = await _generate_json(prompt, purpose="polish sample data")
     responses = data.get("responses") if isinstance(data, dict) else None
     if not isinstance(responses, list):
         raise RuntimeError("Gemini returned no responses")

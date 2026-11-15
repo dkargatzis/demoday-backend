@@ -15,6 +15,7 @@ from typing import Optional, Tuple
 
 import httpx
 
+from app.services import ledger
 from app.config import get_secret
 from app.services import cloud
 from app.services.stitcher import AUDIO_RATE, probe_duration, run_ffmpeg
@@ -90,8 +91,9 @@ async def warm_up_fal() -> None:
         import fal_client
 
         client = fal_client.AsyncClient(key=key)
-        await client.subscribe(FAL_TTS_ENDPOINT, arguments={"prompt": "Ready.", "voice": "af_heart", "speed": 1.0},
-                               client_timeout=300)
+        async with ledger.call("fal", "warm-up", FAL_TTS_ENDPOINT):
+            await client.subscribe(FAL_TTS_ENDPOINT, arguments={"prompt": "Ready.", "voice": "af_heart", "speed": 1.0},
+                                   client_timeout=300)
     except Exception as exc:
         logger.info("fal.ai warm-up did not complete: %s", _short(exc))
 
@@ -100,26 +102,27 @@ async def _fal_tts(text: str, tmp_dir: Path, voice: str, speed: float, key: str)
     import fal_client
 
     client = fal_client.AsyncClient(key=key)
-    result = await client.subscribe(
-        FAL_TTS_ENDPOINT,
-        arguments={"prompt": text, "voice": voice, "speed": speed},
-        client_timeout=FAL_TTS_TIMEOUT_SEC,
-    )
-    audio = (result or {}).get("audio") or {}
-    url = audio.get("url") if isinstance(audio, dict) else None
-    if not url:
-        raise RuntimeError(f"unexpected fal.ai response: {str(result)[:200]}")
+    async with ledger.call("fal", "narration", FAL_TTS_ENDPOINT):
+        result = await client.subscribe(
+            FAL_TTS_ENDPOINT,
+            arguments={"prompt": text, "voice": voice, "speed": speed},
+            client_timeout=FAL_TTS_TIMEOUT_SEC,
+        )
+        audio = (result or {}).get("audio") or {}
+        url = audio.get("url") if isinstance(audio, dict) else None
+        if not url:
+            raise RuntimeError(f"unexpected fal.ai response: {str(result)[:200]}")
 
-    dest = tmp_dir / "fal_audio"
-    if url.startswith("data:"):
-        dest.write_bytes(base64.b64decode(url.split(",", 1)[1]))
-    else:
-        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as http:
-            resp = await http.get(url)
-            resp.raise_for_status()
-            dest.write_bytes(resp.content)
-    if dest.stat().st_size == 0:
-        raise RuntimeError("fal.ai returned an empty audio file")
+        dest = tmp_dir / "fal_audio"
+        if url.startswith("data:"):
+            dest.write_bytes(base64.b64decode(url.split(",", 1)[1]))
+        else:
+            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as http:
+                resp = await http.get(url)
+                resp.raise_for_status()
+                dest.write_bytes(resp.content)
+        if dest.stat().st_size == 0:
+            raise RuntimeError("fal.ai returned an empty audio file")
     return dest
 
 
