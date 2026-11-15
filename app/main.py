@@ -4,18 +4,22 @@ import logging
 import os
 import re
 from contextlib import asynccontextmanager
-from typing import Dict
+from datetime import datetime, timezone
+from typing import Dict, List
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from app.config import BACKEND_ROOT, GEMINI_MODEL, GITHUB_API_URL, capabilities, storage_root  # loads .env first
 from app import auth, db, vault
-from app.models.schemas import (AppLogin, CaptureStart, ErrorDetail, FixtureSet, FixtureSetSummary, GitHubConnection,
+from app.models.schemas import (AppLogin, CaptureStart, ErrorDetail, ErrorMessage, FixtureSet, FixtureSetSummary, GitHubConnection,
+                                JobStarted, JobSummary,
                                 HealthStatus, JobStatus, Ok, PipelineRequest, SettingsOut, ShareLink, _http_url)
 from app.services import cloud, fixtures
 from app.services.capture import CAPTURES, indexed_db_records, origin_of, unpack_login
@@ -61,9 +65,17 @@ app in headless Chromium, assembles a 1080p MP4 with FFmpeg, and writes the READ
 server's signup code when one is configured. Jobs, videos, saved logins and sample data are only visible to their
 owner.
 
-**Live updates.** `GET /api/pipeline/events/{job_id}` is a Server-Sent Events stream: every `data:` message is a full
-`JobStatus` snapshot, the server sends `: keep-alive` comments, and the stream ends after the job reaches
-`completed` or `failed`. `GET /api/pipeline/status/{job_id}` returns the same snapshot on demand.
+**Live updates.** `GET /api/pipeline/events/{job_id}` is a Server-Sent Events stream of typed messages, each with an
+`id`, an `event` name and a JSON `data` body: `job` (`{id, mode}`, first), `step` (`{id, status, label, detail?,
+message?}`; status `running`, `done`, `skipped` or `error`; step ids `repos`, `scrape`, `storyboard`, `launchpack`,
+`ai_clips`, `narration`, `record`, `video`, each in its own order only), `log` (`{message}`), `status` (a full
+`JobStatus` snapshot, what the dashboard renders), then `done` (the full job) or `error` (`{message}`) last. The
+server sends `: keep-alive` comments. Reconnecting with `Last-Event-ID` replays what was missed; a job no longer in
+memory (server restart) gets a single `done` or `error` with id 1. `GET /api/jobs/{job_id}` returns the same object as
+`done`, `GET /api/jobs` lists recent finished jobs, and `GET /api/pipeline/status/{job_id}` is the older alias.
+
+**Errors.** `4xx` responses carry `detail` (a sentence). Validation errors (422) carry `message` (one plain sentence)
+plus Pydantic's per-field `detail`.
 
 **Sign-in capture.** `POST /api/app-logins/capture` opens a server-side browser; the dashboard drives it over the
 WebSocket `/api/app-logins/capture/{capture_id}/ws` (binary frames are JPEG screencast frames; JSON text messages
@@ -75,6 +87,7 @@ OPENAPI_TAGS = [
     {"name": "health", "description": "Service status and which providers are configured."},
     {"name": "auth", "description": "Accounts and the session cookie."},
     {"name": "pipeline", "description": "Start a demo job, follow it live, fetch the video."},
+    {"name": "jobs", "description": "Jobs by id and the recent-jobs list (Launch Kit v2 contract, backend issue #3)."},
     {"name": "settings", "description": "Per-user GitHub token for private repositories."},
     {"name": "app-logins", "description": "Saved sign-in sessions so demos can record pages behind a login."},
     {"name": "fixtures", "description": "Staged sample data: captured API responses, polished by Gemini, replayed while recording."},
@@ -83,7 +96,7 @@ OPENAPI_TAGS = [
 app = FastAPI(
     title="DemoDay Launch Kit Engine",
     description=API_DESCRIPTION,
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
     openapi_tags=OPENAPI_TAGS,
 )
@@ -95,6 +108,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(auth.router)
+
+
+def _validation_sentence(errors: List[Dict]) -> str:
+    """One plain sentence for a 422: a validator's own message, or `field: what is wrong`."""
+    if not errors:
+        return "Invalid request."
+    first = errors[0]
+    msg = re.sub(r"^(Value|Assertion) error, ", "", str(first.get("msg") or "invalid value")).strip()
+    if str(first.get("type", "")).startswith("value_error"):
+        return msg if msg.endswith(".") else msg + "."
+    field = ".".join(str(p) for p in first.get("loc", []) if p not in ("body", "query", "path")) or "request"
+    return f"{field}: {msg[:1].lower() + msg[1:]}."
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
+    errors = jsonable_encoder(exc.errors())
+    return JSONResponse(status_code=422, content={"message": _validation_sentence(errors), "detail": errors})
 
 
 @app.get("/api/health", response_model=HealthStatus, tags=["health"], summary="Service status and capabilities")
@@ -137,10 +168,39 @@ def _job_for(job_id: str, user: Dict) -> JobStatus:
     return job
 
 
-@app.post("/api/pipeline/start", response_model=JobStatus, tags=["pipeline"], summary="Start a demo job",
-          responses={401: {"model": ErrorDetail}, 422: {"description": "Invalid request (e.g. a non-http URL)"}})
+@app.post("/api/pipeline/start", response_model=JobStarted, status_code=202, tags=["pipeline"], summary="Start a demo job",
+          responses={401: {"model": ErrorDetail},
+                     422: {"model": ErrorMessage, "description": "Invalid request (a non-http URL, an unknown goal, ...)"}})
 async def start_pipeline(req: PipelineRequest, user: Dict = Depends(auth.current_user)):
-    return create_pipeline_job(req, user_id=user["id"])
+    job = create_pipeline_job(req, user_id=user["id"])
+    return JobStarted(**job.model_dump(), jobId=job.job_id)
+
+
+@app.get("/api/jobs", response_model=List[JobSummary], tags=["jobs"], summary="Your recent finished jobs, newest first",
+         responses={401: {"model": ErrorDetail}})
+async def list_jobs(user: Dict = Depends(auth.current_user), limit: int = Query(20, ge=1, le=100)):
+    rows = db.query("SELECT id FROM jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT ?", (user["id"], limit * 3))
+    summaries: List[JobSummary] = []
+    for row in rows:
+        try:
+            job = _job_for(row["id"], user)
+        except HTTPException:
+            continue  # lost in a server restart
+        if job.status not in ("completed", "failed"):
+            continue
+        created = datetime.fromtimestamp(job.created_at, timezone.utc).isoformat() if job.created_at else None
+        summaries.append(JobSummary(id=job.job_id, url=job.app_url, createdAt=created, status=job.status,
+                                    productName=job.storyboard.project_name if job.storyboard else None))
+        if len(summaries) >= limit:
+            break
+    return summaries
+
+
+@app.get("/api/jobs/{job_id}", response_model=JobStatus, tags=["jobs"],
+         summary="The full job, running or finished (the same object as the `done` event)",
+         responses={401: {"model": ErrorDetail}, 404: {"model": ErrorDetail, "description": "Not your job, or lost in a server restart"}})
+async def get_job(job_id: str, user: Dict = Depends(auth.current_user)):
+    return _job_for(job_id, user)
 
 
 @app.get("/api/pipeline/status/{job_id}", response_model=JobStatus, tags=["pipeline"], summary="Current job snapshot",
@@ -151,15 +211,18 @@ async def get_status(job_id: str, user: Dict = Depends(auth.current_user)):
 
 @app.get("/api/pipeline/events/{job_id}", tags=["pipeline"], summary="Live job updates (Server-Sent Events)",
          response_class=StreamingResponse,
-         responses={200: {"description": "text/event-stream: each `data:` line is a full JobStatus JSON snapshot; "
-                                         "ends after the job completes or fails",
+         responses={200: {"description": "text/event-stream of typed events (`job`, `step`, `log`, `status`, then `done` or "
+                                         "`error`), each with an `id`; send `Last-Event-ID` to replay what was missed",
                           "content": {"text/event-stream": {"schema": {"type": "string",
-                                      "example": "retry: 3000\n\ndata: {\"job_id\": \"...\", \"status\": \"running\", ...}\n\n"}}}},
+                                      "example": "retry: 3000\n\nid: 1\nevent: job\ndata: {\"id\": \"...\", \"mode\": {...}}\n\n"
+                                                 "id: 2\nevent: step\ndata: {\"id\": \"scrape\", \"status\": \"running\", ...}\n\n"}}}},
                     401: {"model": ErrorDetail}, 404: {"model": ErrorDetail}})
 @app.get("/api/pipeline/stream/{job_id}", include_in_schema=False)  # backwards-compatible alias
-async def stream_events(job_id: str, user: Dict = Depends(auth.current_user)):
+async def stream_events(job_id: str, request: Request, user: Dict = Depends(auth.current_user)):
     _job_for(job_id, user)
-    return StreamingResponse(stream_job_events(job_id), media_type="text/event-stream", headers=SSE_HEADERS)
+    last = (request.headers.get("last-event-id") or "").strip()
+    return StreamingResponse(stream_job_events(job_id, int(last) if last.isdigit() else 0),
+                             media_type="text/event-stream", headers=SSE_HEADERS)
 
 
 @app.get("/api/pipeline/video/{job_id}", tags=["pipeline"], summary="The finished MP4 (supports Range requests)",

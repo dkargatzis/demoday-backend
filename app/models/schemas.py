@@ -1,7 +1,11 @@
-from typing import Any, List, Literal, Optional
+import re
+from typing import Any, Dict, List, Literal, Optional
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+GOALS = ("social", "community", "investors", "customers")  # Launch Kit v2 contract (backend issue #3)
+LANGUAGE_RE = re.compile(r"^[A-Za-z]{2,3}(-[A-Za-z]{2,4})?$")
 
 VoiceStyle = Literal["energetic_tech", "calm_expert", "fast_founder"]
 MAX_REPOS = 5
@@ -25,6 +29,33 @@ class PipelineRequest(BaseModel):
     use_app_login: bool = Field(default=True, description="Record signed in when a saved app login matches the app")
     ai_clips: bool = Field(default=False, description="Add an AI-generated intro and outro (fal.ai video credits)")
     use_staged_data: bool = Field(default=True, description="Replay staged sample data when a set exists for the app")
+    goals: List[str] = Field(default_factory=lambda: list(GOALS),
+                             description="What the launch is for: social, community, investors, customers (default all four). "
+                                         "Echoed as `options.goals` on the job; the demo recording runs regardless")
+    language: str = Field(default="auto", description='Run language: "auto" or a code such as "en", "el", "de". '
+                                                       "Echoed as `options.requestedLanguage`")
+
+    @field_validator("goals")
+    @classmethod
+    def _known_goals(cls, value: List[str]) -> List[str]:
+        goals: List[str] = []
+        for raw in value:
+            goal = str(raw).strip().lower()
+            if goal not in GOALS:
+                raise ValueError(f"Unknown goal '{raw}'. Valid goals: {', '.join(GOALS)}.")
+            if goal not in goals:
+                goals.append(goal)
+        return goals or list(GOALS)
+
+    @field_validator("language")
+    @classmethod
+    def _language_code(cls, value: str) -> str:
+        code = (value or "auto").strip()
+        if code.lower() == "auto":
+            return "auto"
+        if not LANGUAGE_RE.match(code):
+            raise ValueError(f"Unknown language '{value}'. Use \"auto\" or a code such as en, el or de.")
+        return code.lower()
 
     @field_validator("app_url")
     @classmethod
@@ -92,6 +123,30 @@ class JobStatus(BaseModel):
     launch_kit: Optional[LaunchKit] = None
     video_url: Optional[str] = None
     error: Optional[str] = None
+    app_url: Optional[str] = None
+    created_at: Optional[float] = Field(default=None, description="Unix time the job was accepted")
+    options: Dict[str, Any] = Field(default_factory=dict,
+                                    description="Request options echoed for the kit contract: goals, requestedLanguage")
+
+
+class JobStarted(JobStatus):
+    """`POST /api/pipeline/start` (202): the queued job, plus `jobId` as the Launch Kit contract names it."""
+    jobId: str = Field(..., description="The same id as job_id")
+
+
+class JobSummary(BaseModel):
+    """One row of `GET /api/jobs`, camelCase as the Launch Kit contract asks."""
+    id: str
+    url: Optional[str] = None
+    createdAt: Optional[str] = Field(default=None, description="ISO 8601, UTC")
+    productName: Optional[str] = None
+    status: Literal["completed", "failed"]
+
+
+class ErrorMessage(BaseModel):
+    """422: one plain sentence in `message`, Pydantic's per-field errors in `detail`."""
+    message: str = Field(..., examples=["Unknown goal 'press'. Valid goals: social, community, investors, customers."])
+    detail: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- API response models
