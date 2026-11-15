@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 from app import db, vault
 from app.config import capabilities, feature_on, get_secret, storage_root, work_root
 from app.services import analysis as analysis_mod
+from app.services import capabilities as capabilities_mod
 from app.services import funnels as funnels_mod
 from app.services import ledger, music, plancheck, review, vision
 from app.models.schemas import JobStatus, PipelineRequest, StepState
@@ -42,13 +43,14 @@ STEP_LABELS = {
     "understand": "Understanding the pages", "storyboard": "Planning the storyboard", "plancheck": "Checking the plan",
     "launchpack": "Writing the launch kit", "ai_clips": "AI intro and outro", "cover": "Making the cover and title cards",
     "funnels": "Finding the strongest funnels", "code": "Reading the code", "analysis": "Analyzing for the prospect",
+    "capabilities": "Mapping the backend against the app",
     "music": "Composing the soundtrack", "narration": "Synthesizing narration", "record": "Recording the browser session",
     "review": "Reviewing the footage", "retake": "Retaking a scene", "video": "Assembling demo.mp4",
 }
 STEP_TOOLS = {
     "repos": "github", "scrape": "chromium", "audience": "gemini", "understand": "gemini", "storyboard": "gemini",
     "plancheck": "gemini", "launchpack": "gemini", "ai_clips": "fal", "cover": "fal", "music": "fal", "narration": "fal",
-    "funnels": "gemini", "code": "github", "analysis": "gemini",
+    "funnels": "gemini", "code": "github", "analysis": "gemini", "capabilities": "github",
     "record": "chromium", "review": "gemini", "retake": "chromium", "video": "ffmpeg",
 }
 
@@ -838,15 +840,24 @@ async def run_analysis_task(job_id: str, req: PipelineRequest, user_id: Optional
 
         sources = repo_info.get("sources") or []
         code: List[Dict[str, str]] = []
+        capability_map: Optional[Dict[str, Any]] = None
         if sources:
             step("code", "running", detail=f"{len(sources)} repositor{'y' if len(sources) == 1 else 'ies'}: navigation, "
                                            "UI copy, pages, APIs, models")
-            code = await _optional(analysis_mod.read_code(sources, github_token, log), analysis_mod.READ_TIMEOUT_SEC,
-                                   "code", "Code reading") or []
+            step("capabilities", "running", detail="route declarations against the frontend's API calls")
+            code, capability_map = await asyncio.gather(
+                _optional(analysis_mod.read_code(sources, github_token, log), analysis_mod.READ_TIMEOUT_SEC,
+                          "code", "Code reading"),
+                _optional(capabilities_mod.scan(sources, github_token, log), analysis_mod.READ_TIMEOUT_SEC,
+                          "capabilities", "Capability map"))
+            code = code or []
             if code:
                 step("code", "done", detail=f"{len(code)} files, {sum(len(f['text']) for f in code) / 1000:.0f} kB")
+            if capability_map is not None:
+                step("capabilities", "done", detail=capabilities_mod.summary_line(capability_map).replace("Capability map: ", ""))
         else:
             step("code", "skipped", detail="No readable repository")
+            step("capabilities", "skipped", detail="No readable repository")
         brief = None
         if audience_task is not None:
             brief = await audience_task
@@ -871,7 +882,7 @@ async def run_analysis_task(job_id: str, req: PipelineRequest, user_id: Optional
         step("analysis", "running", detail=f"{len(code)} files and {len(pages) + 1} pages"
                                            + (f" for {brief.company}" if brief is not None else ""))
         log(f"Gemini is analyzing {project}" + (f" for {brief.company}" if brief is not None else "") + "...")
-        result = await analysis_mod.analyze(project, repo_info, app_info, code, brief, req.instructions)
+        result = await analysis_mod.analyze(project, repo_info, app_info, code, brief, req.instructions, capability_map)
         job.analysis = result
         step("analysis", "done", detail=analysis_mod.step_detail(result))
         log(analysis_mod.summary_line(result))

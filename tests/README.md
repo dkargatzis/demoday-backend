@@ -17,6 +17,7 @@ servers. Each is a plain script that prints one line per check and exits 1 on a 
 | `check_bookends.py` | Title cards and the cover poster: the product's own screen in a browser frame (checked by pixel), the FLUX fallback (cards rendered before the image call, the product name never sent to the image model; FLUX failure, timeout, no key, `FEATURE_COVER=0`), `prepare_poster` |
 | `check_gemini.py` | The one Gemini entry point on a fake client: a malformed reply asked for once more (its own ledger row), a JSON schema sent with the thinking level, a rejected schema falling back, the launch kit's schema |
 | `check_funnels.py` | The funnels step: flow files in the code, the reachable pages (no sign-in pages), ranking and caps, the prompt, a fake Gemini call, and which of the product's screens the cards frame |
+| `check_capabilities.py` | The capability map: route declarations across FastAPI, Flask, Fastify, Express and Next.js with their mount prefixes (through imports, grouped mounts), frontend API calls, matching by path and method, coverage per area, deprecated routers kept out of the gaps |
 | `check_core.py` | Vault, password hashing, netguard, request validation, private and multi-repo ingest against a fake GitHub |
 | `check_music.py` | The soundtrack: the ducked mix (loudness, A/V sync, the video stream copied), fail-soft compose on fake fal responses, the final-cut wrapper |
 | `check_plancheck.py` | The plan check before filming: selectors and routes verified against the inventory, the Gemini repair (faked), pacing fit to the measured voice |

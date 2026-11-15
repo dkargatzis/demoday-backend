@@ -88,7 +88,8 @@ def select_files(tree: Sequence[Tuple[str, int]], flow: Set[str] = frozenset(), 
     return picked
 
 
-async def _fetch_text(client: httpx.AsyncClient, source: Dict[str, Any], path: str, private_api: bool) -> str:
+async def _fetch_text(client: httpx.AsyncClient, source: Dict[str, Any], path: str, private_api: bool,
+                      limit: int = MAX_FILE_BYTES * 2) -> str:
     owner, repo, branch = source["owner"], source["repo"], source.get("branch") or "main"
     if private_api:  # the contents API takes the token (private repositories); raw.githubusercontent does not
         url = f"{GITHUB_API}/repos/{owner}/{repo}/contents/{quote(path)}?ref={quote(branch)}"
@@ -101,7 +102,7 @@ async def _fetch_text(client: httpx.AsyncClient, source: Dict[str, Any], path: s
         return ""
     if resp.status_code != 200 or b"\x00" in resp.content[:2048]:
         return ""
-    return resp.content[:MAX_FILE_BYTES * 2].decode("utf-8", errors="replace")
+    return resp.content[:limit].decode("utf-8", errors="replace")
 
 
 async def read_code(sources: Sequence[Dict[str, Any]], token: Optional[str] = None,
@@ -156,7 +157,9 @@ def _prospect_lines(brief: Optional[AudienceBrief]) -> str:
 
 
 def build_prompt(project: str, repo_info: dict, app_info: dict, code: Sequence[Dict[str, str]],
-                 brief: Optional[AudienceBrief] = None, instructions: Optional[str] = None) -> str:
+                 brief: Optional[AudienceBrief] = None, instructions: Optional[str] = None,
+                 capability_map: Optional[Dict[str, Any]] = None) -> str:
+    from app.services.capabilities import prompt_section as map_section
     files = "\n\n".join(f"### {f['repo']}/{f['path']} ({f['role']})\n<<<\n{f['text'].replace('<<<', '<<').replace('>>>', '>>')}\n>>>"
                         for f in code) or "(no repository was readable: judge from the live app only)"
     focus = (f"\nTHE FOUNDER'S FOCUS (their own words; weigh it, but report what the code and app support)\n<<<\n"
@@ -178,6 +181,7 @@ PROSPECT
 LIVE APP: reachable pages (use ONLY these paths as funnel steps)
 {chr(10).join(_site_map(app_info))}
 
+{map_section(capability_map)}
 CODE (the heads of the files that say most about the product)
 {files}
 
@@ -191,7 +195,8 @@ Return JSON with:
   visible controls on reachable pages) and "strength" (0-1).
 - "gaps": up to 6 things this prospect would look for that the product lacks or hides: "title", "kind"
   ({' | '.join(GAP_KINDS)}), "why_them", "evidence" (what the code shows, for example an API with no page, or what is
-  absent) and "suggestion" (the smallest change that would close it)."""
+  absent) and "suggestion" (the smallest change that would close it). An api_without_page gap must name endpoints
+  from the CAPABILITY MAP's list (METHOD path), when the map is given."""
 
 
 SCHEMA: Dict[str, Any] = {
@@ -253,14 +258,20 @@ def sanitize(data: Any, app_info: dict) -> Dict[str, Any]:
 
 
 async def analyze(project: str, repo_info: dict, app_info: dict, code: Sequence[Dict[str, str]],
-                  brief: Optional[AudienceBrief] = None, instructions: Optional[str] = None) -> Dict[str, Any]:
+                  brief: Optional[AudienceBrief] = None, instructions: Optional[str] = None,
+                  capability_map: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """The analysis for the founder (raises on a Gemini failure: the analysis is the job's result)."""
-    data = await gemini.generate_json(build_prompt(project, repo_info, app_info, code, brief, instructions), deep=True,
+    prompt = build_prompt(project, repo_info, app_info, code, brief, instructions, capability_map)
+    data = await gemini.generate_json(prompt, deep=True,
                                       schema=SCHEMA, timeout_sec=ANALYSIS_TIMEOUT_SEC, purpose="prospect analysis")
     result = sanitize(data, app_info)
     result.update(project=project, prospect=brief.company if brief is not None else None,
                   files_read=[{"repo": f["repo"], "path": f["path"], "role": f["role"]} for f in code],
                   pages=reachable_paths(app_info))
+    if capability_map and capability_map.get("endpoints"):
+        result["capabilities"] = {key: capability_map.get(key) for key in
+                                  ("endpoints", "called", "uncalled_total", "retired", "frontend_seen", "files_scanned")}
+        result["capabilities"].update(areas=capability_map["areas"][:20], uncalled=capability_map["uncalled"][:60])
     return result
 
 
