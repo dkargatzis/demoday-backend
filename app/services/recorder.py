@@ -667,3 +667,113 @@ class _Director:
     @staticmethod
     def _budget_ms(deadline: float) -> int:
         return max(500, int((deadline - time.monotonic()) * 1000))
+
+
+# --------------------------------------------------------------------------- pacing fit (pure arithmetic, no browser)
+
+# Seconds an action spends before its dwell starts, measured on the e2e logs. A page change costs the most: an
+# explicit navigate, or a click on a link to another page (which the recorder opens directly, after the selector
+# timeout, when the link is not on screen). A scroll only starts the motion; the dwell covers it.
+ACTION_COST_SEC = {"wait": 0.0, "scroll": 0.3, "click": 0.9, "type": 0.6, "navigate": 2.5}
+LINK_CHANGE_SEC = 2.0  # a click on a link to another page: ~1.3 s when it is on screen, ~2.7 s when opened directly
+SUBMIT_COST_SEC = 1.0  # Enter after typing usually loads results: the recorder waits for the page to settle
+FIT_RESERVE_SEC = 0.5  # run() starts no action within 0.25 s of the deadline, and the last hold needs room
+MIN_DWELL_SEC = max(0.3, MIN_HOLD_SEC)  # a trimmed click still keeps its zoom on screen
+MIN_FIT_SCALE = 0.4  # below this the pauses are unreadable: drop trailing actions instead (they would be skipped anyway)
+SPREAD_BELOW, SPREAD_TO = 0.6, 0.9  # a plan that fills under 60 % of the clip is spread over 90 % of it
+MAX_DWELL_MS = 15_000  # Action.dwell_ms upper bound
+
+
+def _path_after(current_path: str, target: Optional[str]) -> str:
+    """The page path after following `target` (a route, href or URL) from `current_path`; '/' + no trailing slash."""
+    resolved = urljoin(f"https://app{current_path if current_path.startswith('/') else '/' + current_path}",
+                       (target or "").strip())
+    return urlparse(resolved).path.rstrip("/") or "/"
+
+
+def action_cost_sec(action: Action, current_path: str) -> Tuple[float, str]:
+    """(seconds the recorder spends on `action` before its dwell starts, the page path afterwards)."""
+    if action.type == "navigate":
+        return ACTION_COST_SEC["navigate"], _path_after(current_path, action.value)
+    if action.type == "click":
+        href = _link_href(action.selector)
+        if href:
+            target = _path_after(current_path, href)
+            if target != current_path:
+                return LINK_CHANGE_SEC, target
+        return ACTION_COST_SEC["click"], current_path
+    if action.type == "type":
+        text = (action.value or "").rstrip("\n")[:MAX_TYPED_CHARS]
+        delay = max(20, min(80, 1400 // max(1, len(text))))  # mirrors _perform
+        cost = ACTION_COST_SEC["type"] + len(text) * delay / 1000
+        if (action.value or "").endswith("\n"):
+            cost += SUBMIT_COST_SEC
+        return cost, current_path
+    return ACTION_COST_SEC.get(action.type, 0.0), current_path
+
+
+def fit_dwells(scenes: Sequence[Scene], clip_durations: Sequence[float], log: Optional[LogFn] = None) -> int:
+    """Re-times each scene's dwells to its measured narration clip so run() never skips a planned action.
+
+    Per scene: available = clip - FIT_RESERVE_SEC - the actions' own cost; dwells over that are scaled down (while the
+    scale would fall under MIN_FIT_SCALE, trailing actions are dropped, keeping at least one) but never under
+    MIN_DWELL_SEC; a plan using under SPREAD_BELOW of the clip is spread to SPREAD_TO of it instead of leaving an
+    idle tail. Mutates the scenes in place, logs one line per adjusted scene, never raises, and returns the number
+    of scenes adjusted. record_session is untouched: its deadline logic stays the safety net.
+    """
+    log = log or (lambda message: None)
+    adjusted = 0
+    for index, (scene, clip) in enumerate(zip(scenes, clip_durations)):
+        try:
+            adjusted += int(_fit_scene(index + 1, scene, float(clip), log))
+        except Exception as exc:  # noqa: BLE001 - a pacing estimate must never cost the demo
+            logger.warning("fit_dwells: scene %d left as planned (%s)", index + 1, exc)
+    return adjusted
+
+
+def _fit_scale(available: float, planned: float) -> float:
+    if planned > 0:
+        return available / planned
+    return 1.0 if available >= 0 else 0.0
+
+
+def _fit_scene(scene_no: int, scene: Scene, clip: float, log: LogFn) -> bool:
+    actions = list(scene.actions)
+    if not actions or clip <= 0:
+        return False
+    path, costs = _path_after("/", scene.route), []
+    for action in actions:
+        cost, path = action_cost_sec(action, path)
+        costs.append(cost)
+    before_ms = [action.dwell_ms for action in actions]
+    total_need = sum(costs) + sum(before_ms) / 1000 + FIT_RESERVE_SEC
+    kept = len(actions)
+    overhead, planned = sum(costs), sum(before_ms) / 1000
+    available = clip - FIT_RESERVE_SEC - overhead
+    if planned > available:
+        scale = _fit_scale(available, planned)
+        while scale < MIN_FIT_SCALE and kept > 1:
+            kept -= 1
+            overhead, planned = sum(costs[:kept]), sum(before_ms[:kept]) / 1000
+            available = clip - FIT_RESERVE_SEC - overhead
+            scale = _fit_scale(available, planned)
+        scale = max(0.0, min(1.0, scale))
+        for action in actions[:kept]:
+            if action.dwell_ms > 0:
+                action.dwell_ms = max(int(MIN_DWELL_SEC * 1000), int(round(action.dwell_ms * scale)))
+        scene.actions = actions[:kept]
+        after = sum(action.dwell_ms for action in scene.actions) / 1000
+        dropped = len(actions) - kept
+        log(f"Scene {scene_no}: {len(actions)} action{'' if len(actions) == 1 else 's'} need ~{total_need:.1f}s but the "
+            f"narration clip is {clip:.1f}s; " + (f"{dropped} trailing action{'' if dropped == 1 else 's'} dropped and " if dropped else "")
+            + f"dwells trimmed {sum(before_ms) / 1000:.1f}→{after:.1f}s so every click lands on camera")
+        return True
+    if 0 < planned < SPREAD_BELOW * available:
+        scale = SPREAD_TO * available / planned
+        for action in actions:
+            action.dwell_ms = min(MAX_DWELL_MS, int(round(action.dwell_ms * scale)))
+        after = sum(action.dwell_ms for action in actions) / 1000
+        log(f"Scene {scene_no}: {len(actions)} action{'' if len(actions) == 1 else 's'} fill only ~{overhead + planned:.1f}s of "
+            f"the {clip:.1f}s narration clip; dwells spread {planned:.1f}→{after:.1f}s so the scene has no idle tail")
+        return True
+    return False
