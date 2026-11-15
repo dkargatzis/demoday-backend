@@ -472,7 +472,7 @@ Return JSON with exactly these keys:
 """
     if get_secret("GEMINI_API_KEY"):
         try:
-            data = await _generate_json(prompt, purpose="launch kit")
+            data = await generate_json(prompt, purpose="launch kit", schema=launch_kit_schema(audience is not None))
             kit = _sanitize_launch_kit(data)
             outreach = await audience_mod.attach_checked_outreach(
                 kit, data, audience, storyboard, app_url, own_text=audience_mod.product_text(repo_info, app_info), log=log)
@@ -484,6 +484,20 @@ Return JSON with exactly these keys:
         reason = "GEMINI_API_KEY not set"
     kit = _template_launch_kit(storyboard, repo_info, app_info, repo_url, app_url)
     return kit, f"{reason}: template launch kit fallback" + audience_mod.attach_outreach(kit, None, audience, storyboard, app_url)
+
+
+def launch_kit_schema(personalized: bool = False) -> dict:
+    """The launch kit's JSON shape for Gemini's structured output: the README, the Devpost pitch, the X thread and
+    the LinkedIn post, plus the outreach email and LinkedIn DM on a personalized run. Constrained decoding keeps a
+    stray quote in the Markdown from breaking the JSON (the kit would otherwise fall back to the template)."""
+    properties: dict = {"readme_markdown": {"type": "string"}, "devpost_pitch": {"type": "string"},
+                        "x_thread": {"type": "array", "items": {"type": "string"}}, "linkedin_post": {"type": "string"}}
+    if personalized:
+        properties["outreach_email"] = {"type": "object", "properties": {"subject": {"type": "string"},
+                                                                         "body": {"type": "string"}},
+                                        "required": ["subject", "body"]}
+        properties["linkedin_dm"] = {"type": "string"}
+    return {"type": "object", "properties": properties, "required": list(properties)}
 
 
 def _sanitize_launch_kit(data: Any) -> LaunchKit:
