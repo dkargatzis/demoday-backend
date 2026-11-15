@@ -67,12 +67,19 @@ owner.
 
 **Live updates.** `GET /api/pipeline/events/{job_id}` is a Server-Sent Events stream of typed messages, each with an
 `id`, an `event` name and a JSON `data` body: `job` (`{id, mode}`, first), `step` (`{id, status, label, detail?,
-message?}`; status `running`, `done`, `skipped` or `error`; step ids `repos`, `scrape`, `storyboard`, `launchpack`,
-`ai_clips`, `narration`, `record`, `video`, each in its own order only), `log` (`{message}`), `status` (a full
+message?, tool, t, extra?}`; status `running`, `done`, `skipped` or `error`; step ids `repos`, `scrape`, `audience`,
+`understand`, `storyboard`, `plancheck`, `launchpack`, `ai_clips`, `cover`, `music`, `narration`, `record`, `review`,
+`retake`, `video`, each in its own order only; `tool` is gemini, fal, chromium, ffmpeg or github; `extra` carries
+one-off payloads such as page thumbnails and review verdicts), `log` (`{message}`), `status` (a full
 `JobStatus` snapshot, what the dashboard renders), then `done` (the full job) or `error` (`{message}`) last. The
 server sends `: keep-alive` comments. Reconnecting with `Last-Event-ID` replays what was missed; a job no longer in
 memory (server restart) gets a single `done` or `error` with id 1. `GET /api/jobs/{job_id}` returns the same object as
 `done`, `GET /api/jobs` lists recent finished jobs, and `GET /api/pipeline/status/{job_id}` is the older alias.
+
+**Personalized demos.** `PipelineRequest.audience` (company, persona, website, first name, goal, link, notes) makes
+the run for one customer: their public site is read for at most 15 s, a source-tagged brief steers the storyboard,
+the intro/outro cards name them, and the launch kit gains `outreach_email` and `linkedin_dm` carrying the literal
+`{{DEMO_LINK}}` placeholder. The job carries `audience` from the 202 on (source `pending` until research finishes).
 
 **Errors.** `4xx` responses carry `detail` (a sentence). Validation errors (422) carry `message` (one plain sentence)
 plus Pydantic's per-field `detail`.
@@ -190,7 +197,11 @@ async def list_jobs(user: Dict = Depends(auth.current_user), limit: int = Query(
             continue
         created = datetime.fromtimestamp(job.created_at, timezone.utc).isoformat() if job.created_at else None
         summaries.append(JobSummary(id=job.job_id, url=job.app_url, createdAt=created, status=job.status,
-                                    productName=job.storyboard.project_name if job.storyboard else None))
+                                    productName=job.storyboard.project_name if job.storyboard else None,
+                                    customer=job.audience.company if job.audience else None,
+                                    persona=job.audience.persona if job.audience else None,
+                                    customerGoal=job.audience.goal if job.audience else None,
+                                    durationSec=job.storyboard.total_duration_sec if job.storyboard else None))
         if len(summaries) >= limit:
             break
     return summaries

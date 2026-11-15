@@ -9,17 +9,18 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Set, Tuple
 
 from app import db, vault
-from app.config import capabilities, get_secret, storage_root, work_root
-from app.services import ledger
+from app.config import capabilities, feature_on, get_secret, storage_root, work_root
+from app.services import ledger, music, plancheck, review, vision
 from app.models.schemas import JobStatus, PipelineRequest, StepState
+from app.services import audience
 from app.services.audio import synthesize_scene_audio, warm_up_fal
-from app.services.bookends import FAL_VIDEO_MODEL, prepare_bookends
+from app.services.bookends import FAL_IMAGE_MODEL, FAL_VIDEO_MODEL, prepare_bookends
 from app.services.capture import describe_login, origin_of, unpack_login
 from app.services.fixtures import FixtureReplayer, get_set_for_origin
 from app.services.ingest import extract_repos_context, probe_app_url
 from app.services.netguard import BlockedURL, ensure_public_url
 from app.services.planner import generate_launch_kit, generate_storyboard
-from app.services.recorder import record_session
+from app.services.recorder import fit_dwells, record_session
 from app.services.stitcher import concat_scenes, describe_media, frame_aligned, make_bookend, mux_scene_clip
 
 logger = logging.getLogger("demoday.pipeline")
@@ -211,6 +212,11 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
     job.status = "running"
     kit_task: Optional[asyncio.Task] = None
     bookend_task: Optional[asyncio.Task] = None
+    audience_task: Optional[asyncio.Task] = None
+    music_task: Optional[asyncio.Task] = None
+    music_skipped: Optional[Callable[[str], None]] = None
+    review_task: Optional[asyncio.Task] = None
+    bookend_mode: Optional[str] = None
     background: List[asyncio.Task] = []  # optional work (warm-up, cover, music, review): cancelled before completion
     job_dir: Optional[Path] = None
 
@@ -247,6 +253,13 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
                 log(f"Staged sample data: {fixture_set['enabled_count']} endpoint(s) for {fixture_set['origin']}"
                     + (" (Gemini-polished)" if fixture_set["polished"] else "") + "; the video is labelled 'Sample data'")
 
+        if req.audience:  # researched beside the ingest; build_audience never raises
+            step("audience", "running", detail=audience.running_detail(req.audience))
+            audience_task = asyncio.create_task(
+                audience.build_audience(req.audience, req.target_seconds, log, req.app_url))
+        else:
+            step("audience", "skipped", detail="No customer in this run")
+
         # 1. Ingest repositories + live app
         job.stage, job.progress = "ingesting", 5
         if req.repo_urls:
@@ -257,8 +270,12 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
         for url in req.repo_urls:
             log(f"Analyzing GitHub repository: {url}")
         log(f"Rendering live app in headless Chromium: {req.app_url}")
+        shots_dir = job_dir / "shots"  # local scratch for the vision brief; the trace gets 320 px thumbnails
         repo_info, app_info = await asyncio.gather(
-            extract_repos_context(req.repo_urls, github_token), probe_app_url(req.app_url, storage_state, replayer)
+            extract_repos_context(req.repo_urls, github_token),
+            probe_app_url(req.app_url, storage_state, replayer, shots_dir=shots_dir if feature_on("VISION") else None,
+                          on_page=lambda p: log(f"Explored {p['path']}: '{p['title']}' "
+                                                f"({len(p['headings'])} headings, {len(p['buttons'])} buttons)")),
         )
         if app_info.get("error"):
             raise RuntimeError(f"Navigation to {req.app_url} failed: {app_info['error']}")
@@ -290,33 +307,132 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
             log("Warning: the app still shows a sign-in form with your saved login; it may have expired. "
                 "Capture the login again in Settings." if storage_state else
                 "Warning: the app shows a sign-in form. Save an app login in Settings to record signed-in pages.")
+        brief = None
+        if audience_task is not None:
+            if not audience_task.done():
+                log("Waiting for the customer brief...")
+            brief = await audience_task
+            job.audience = brief
+            step("audience", "done", detail=audience.step_detail(brief))
         job.progress = 20
+
+        # 1b. Understand: Gemini looks at the page screenshots once; a failure costs one log line, never the demo
+        shots = [p for p in [app_info.get("screenshot"), *(pg.get("screenshot") for pg in pages)] if p]
+        if feature_on("VISION") and get_secret("GEMINI_API_KEY") and shots:
+            step("understand", "running", detail=f"{len(shots)} screenshots → Gemini")
+            log(f"Gemini is looking at {len(shots)} page screenshots...")
+            insights = await _optional(vision.describe_pages(app_info, log), 20, "understand", "Understand")
+            if insights:
+                await vision.thumbnails(insights)
+                log(vision.summary_line(insights))
+                step("understand", "done", detail=" · ".join(f"{i['path']}: {i['purpose']}" for i in insights)[:200],
+                     extra={"pages": insights})
 
         # 2. Plan the storyboard; write the launch kit in the background meanwhile
         job.stage = "planning"
         step("storyboard", "running")
         log("Planning the storyboard...")
+        want_music = feature_on("MUSIC") and bool(get_secret("FAL_KEY"))
+        # Title cards: always for a personalized run ("Made for Acme"); for a generic run only with FEATURE_COVER=1.
+        title_cards = not req.ai_clips and (brief is not None or feature_on("COVER", default=False))
         storyboard, note = await generate_storyboard(
-            repo_info, app_info, req.target_seconds, req.voice_style, ", ".join(req.repo_urls), ai_clips=req.ai_clips
+            repo_info, app_info, req.target_seconds, req.voice_style, ", ".join(req.repo_urls),
+            ai_clips=req.ai_clips, audience=brief, title_cards=title_cards, want_music=want_music,
         )
         log(note)
         job.storyboard = storyboard
         scenes = storyboard.scenes
-        log(f"Storyboard: {len(scenes)} scenes across {len({s.route for s in scenes})} page(s) for \"{storyboard.project_name}\"")
-        step("storyboard", "done", detail=f"{len(scenes)} scenes; {note}")
+        n_pages = len({s.route for s in scenes})
+        why = f" — why: {storyboard.plan_rationale}" if storyboard.plan_rationale else ""
+        log(f"Storyboard: {len(scenes)} scenes across {n_pages} page(s) for \"{storyboard.project_name}\"{why}")
+        if brief is not None:
+            for line in audience.check_storyboard(storyboard, brief, app_info, repo_info):
+                log(line)
+        step("storyboard", "done", detail=f"{len(scenes)} scenes across {n_pages} page(s)"
+                                          + (f" · {storyboard.plan_rationale}" if storyboard.plan_rationale else f"; {note}"))
+
+        # 2b. Plan check: verified against the inventory before any voice or camera time is spent
+        repo_routes = repo_info.get("routes", [])
+        verified = sum(len(s.actions) for s in scenes)
+        step("plancheck", "running", detail=f"{verified} actions across {len(scenes)} scenes")
+        found = plancheck.verify(storyboard, app_info, repo_routes)
+        for line in plancheck.notes(storyboard, req.target_seconds, req.voice_style, req.ai_clips):
+            log(f"Plan check: {line}")
+        left, revised, repair_sec, fixed, reason = [], [], None, 0, None
+        if not found:
+            log(f"Plan check: {len(scenes)} scenes, {verified} actions verified against the inventory, 0 issues")
+        else:
+            can_repair = bool(get_secret("GEMINI_API_KEY")) and feature_on("PLANCHECK")
+            log(f"Plan check: {plancheck.summarize(found)}" + (" → asking Gemini to revise" if can_repair else ""))
+            left = found
+            if can_repair:
+                t_repair = time.monotonic()
+                repaired = await _optional(plancheck.repair(storyboard, found, app_info, log, repo_routes),
+                                           15, "plancheck", "Plan check")
+                if repaired is not None:
+                    repair_sec = time.monotonic() - t_repair
+                    revised = plancheck.changed_scenes(storyboard, repaired)
+                    storyboard = repaired  # only the revised scenes' routes/actions differ; the narration is the original
+                    job.storyboard = storyboard
+                    scenes = storyboard.scenes
+                    left = plancheck.verify(storyboard, app_info, repo_routes)
+                else:
+                    reason = "Gemini repair skipped"
+            else:
+                reason = "no Gemini key" if not get_secret("GEMINI_API_KEY") else "FEATURE_PLANCHECK off"
+            fixed = plancheck.drop_invalid(storyboard, left, log)  # the deterministic last word
+        step("plancheck", "done", detail=plancheck.describe(verified, found, revised, repair_sec, left, fixed, reason))
         step("launchpack", "running")
         kit_task = asyncio.create_task(
-            generate_launch_kit(storyboard, repo_info, app_info, ", ".join(req.repo_urls), req.app_url)
+            generate_launch_kit(storyboard, repo_info, app_info, ", ".join(req.repo_urls), req.app_url, audience=brief)
         )
-        if not req.ai_clips:
+        # Bookends: "video" = the AI clips (ai_clips); "cards" = typeset title cards on a fal.ai FLUX still (step "cover").
+        bookend_mode = "video" if req.ai_clips else "cards" if title_cards else None
+        if bookend_mode != "video":
             step("ai_clips", "skipped", detail="Not requested in this run")
-        else:  # generated by fal.ai while the browser records
-            step("ai_clips", "running")
-            log(f"Generating the AI intro and outro with fal.ai ({FAL_VIDEO_MODEL})..." if get_secret("FAL_KEY")
-                else "FAL_KEY not set: the intro and outro will be typeset title cards")
+        if bookend_mode:
+            overrides = (audience.bookend_overrides(brief, storyboard.project_name, req.app_url, req.target_seconds)
+                         if brief is not None else None)
+            if overrides:
+                log(f"Intro card: \"{overrides['intro']['kicker']}\"; outro card: \"{overrides['outro']['title']}\" -> "
+                    f"{overrides['outro']['subtitle']}")
+            if bookend_mode == "cards":
+                step("cover", "running", detail=f"Title cards for {brief.company}" if brief is not None else FAL_IMAGE_MODEL)
+            else:
+                step("ai_clips", "running", detail=f"Personalized for {brief.company}" if brief is not None else None)
+                log(f"Generating the AI intro and outro with fal.ai ({FAL_VIDEO_MODEL})..." if get_secret("FAL_KEY")
+                    else "FAL_KEY not set: the intro and outro will be typeset title cards")
             bookend_task = asyncio.create_task(prepare_bookends(
                 job_dir, storyboard.project_name, storyboard.tagline, req.app_url, req.repo_urls, req.voice_style,
-                {"intro": storyboard.intro_visual, "outro": storyboard.outro_visual}, log))
+                {"cover": storyboard.cover_visual, "intro": storyboard.intro_visual, "outro": storyboard.outro_visual},
+                log, mode=bookend_mode, overrides=overrides, video=req.ai_clips))
+            if bookend_mode == "cards":
+                def _cover_ready(task: asyncio.Task) -> None:  # the thumbnail reaches the trace while the camera rolls
+                    if task.cancelled() or task.exception() is not None or job.status in TERMINAL:
+                        return  # a failure is reported by _optional when the cut collects the cards
+                    ready = task.result()
+                    d1, d2 = (frame_aligned(max(3.0, ready[k].narration_sec + BOOKEND_VOICE_DELAY_SEC + 0.6))
+                              for k in ("intro", "outro"))
+                    step("cover", "done", detail=f"{ready['intro'].note} · intro {d1:.1f}s · outro {d2:.1f}s",
+                         extra={"thumb": ready["intro"].thumb} if ready["intro"].thumb else None)
+                    storyboard.cover = ready["intro"].note
+                bookend_task.add_done_callback(_cover_ready)
+
+        if want_music:  # fal.ai composes while we narrate and record; ducked under the voice at the final cut
+            music_brief, _ = music.brief_for(storyboard.music_prompt, req.voice_style)
+
+            def _music_skipped(reason: str) -> None:  # amber row + the storyboard note, from compose or finish
+                storyboard.soundtrack = f"skipped: {reason}"
+                step("music", "error", message=reason)
+
+            music_skipped = _music_skipped
+            step("music", "running", detail=f"{music_brief[:90]} → {music.model_label()}")
+            music_task = asyncio.create_task(music.compose(
+                storyboard.music_prompt, music.bed_seconds_for(req.target_seconds), job_dir, log,
+                voice_style=req.voice_style, on_skip=music_skipped))
+            _TASKS.add(music_task)
+            music_task.add_done_callback(_TASKS.discard)
+            background.append(music_task)
         job.progress = 35
 
         # 3. Narration (all scenes in parallel); durations measured with ffprobe
@@ -331,14 +447,16 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
         for i, (scene, (duration, engine)) in enumerate(zip(scenes, narrations)):
             scene.duration_sec = round(duration, 3)
             log(f"Scene {i + 1}/{len(scenes)}: {duration:.2f}s of narration via {engine}")
-        step("narration", "done", detail=f"{sum(d for d, _ in narrations):.1f}s across {len(scenes)} scenes")
+        clip_durations = [frame_aligned(duration + SCENE_TAIL_SEC) for duration, _ in narrations]
+        retimed = fit_dwells(scenes, clip_durations, log)  # dwells re-timed to the measured voice; never raises
+        step("narration", "done", detail=f"{sum(d for d, _ in narrations):.1f}s across {len(scenes)} scenes"
+             + (f" · {retimed} scene{'' if retimed == 1 else 's'} re-timed to the voice" if retimed else ""))
         job.progress = 45
 
         # 4. Record + encode
         if _RENDER_SLOT.locked():
             log("Waiting for another job to finish rendering...")
         async with _RENDER_SLOT:
-            clip_durations = [frame_aligned(duration + SCENE_TAIL_SEC) for duration, _ in narrations]
             step("record", "running", detail=f"{sum(clip_durations):.1f}s of footage")
             log(f"Recording one continuous 1920x1080 browser session ({sum(clip_durations):.1f}s of footage)...")
 
@@ -365,11 +483,25 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
                 job.progress = 65 + int(17 * (i + 1) / len(segments))
             step("record", "done", detail=f"{len(clips)} clips, {sum(len(s.focus or []) for s in segments)} focus zooms")
 
+        # 4b. Review the footage in the background (Gemini on contact sheets of the muxed clips); it overlaps the
+        # bookend wait and encodes, and is collected before the cut while clips[i] still pairs with scenes[i].
+        if feature_on("REVIEW") and get_secret("GEMINI_API_KEY"):
+            step("review", "running", detail=f"{len(clips)} scenes, {review.FRAMES_PER_SCENE} frames each")
+            review_task = asyncio.create_task(review.review_scenes(list(clips), scenes, job_dir, log,
+                                                                   project_name=storyboard.project_name))
+            _TASKS.add(review_task)
+            review_task.add_done_callback(_TASKS.discard)
+            background.append(review_task)
+
         # 5. Intro and outro (outside the render slot while fal.ai may still be generating)
         job.stage = "assembling"
         step("video", "running")
         bookends = None
-        if bookend_task is not None:
+        if bookend_task is not None and bookend_mode == "cards":
+            if not bookend_task.done():
+                log("Waiting for the title cards...")
+            bookends = await _optional(bookend_task, 60, "cover", "Cover art")  # done row comes from _cover_ready
+        elif bookend_task is not None:
             if not bookend_task.done():
                 log("Waiting for the AI intro and outro from fal.ai...")
             try:
@@ -379,8 +511,10 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
                 logger.exception("[%s] bookends failed", job_id)
                 log(f"Warning: skipping the intro and outro ({str(exc).strip()[:140] or type(exc).__name__})")
                 step("ai_clips", "error", message=str(exc).strip()[:140] or type(exc).__name__)
-        async with _RENDER_SLOT:
-            if bookends:
+        intro_path: Optional[Path] = None
+        outro_path: Optional[Path] = None
+        if bookends:
+            async with _RENDER_SLOT:
                 for kind, fade in (("intro", "in"), ("outro", "out")):
                     bookend = bookends[kind]
                     duration = frame_aligned(max(3.0, bookend.narration_sec + BOOKEND_VOICE_DELAY_SEC + 0.6))
@@ -389,16 +523,53 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
                                        video_path=bookend.video, background_png=bookend.background,
                                        voice_delay_sec=BOOKEND_VOICE_DELAY_SEC)
                     if kind == "intro":
-                        clips.insert(0, path)
-                        storyboard.intro_sec = duration
+                        intro_path, storyboard.intro_sec = path, duration
                     else:
-                        clips.append(path)
-                        storyboard.outro_sec = duration
+                        outro_path, storyboard.outro_sec = path, duration
                     log(f"{kind.capitalize()} clip ready ({duration:.1f}s)")
+
+        # 5b. Review verdicts and the gated retake, while clips[i] still pairs with scenes[i]
+        if review_task is not None:
+            verdicts = await _optional(review_task, 20, "review", "Review")
+            if verdicts is not None:
+                step("review", "done", detail=review.summarize(verdicts), extra=review.as_extra(verdicts))
+                idx = review.should_retake(verdicts)
+                if idx is None:
+                    step("retake", "skipped", detail="Not needed")
+                elif not feature_on("RETAKE", default=False):
+                    step("retake", "skipped", detail=f"scene {idx + 1} qualifies; retakes are off (FEATURE_RETAKE=0)")
+                else:
+                    flagged = verdicts[idx]
+                    step("retake", "running", detail=f"scene {idx + 1}: {flagged.issue or flagged.seen or flagged.verdict}")
+                    log(f"Retake: re-recording scene {idx + 1} '{scenes[idx].title}' once in a fresh session...")
+                    async with _RENDER_SLOT:  # the recording is timing-sensitive
+                        new_clip = await _optional(
+                            review.retake_scene(scenes[idx], idx, req.app_url, clip_durations[idx], audio_paths[idx],
+                                                job_dir, log, storage_state=storage_state, replayer=replayer,
+                                                project_name=storyboard.project_name),
+                            clip_durations[idx] + 45, "retake", "Retake")
+                    if new_clip:
+                        clips[idx] = new_clip  # same length and codec parameters: drops straight into the cut
+                        step("retake", "done", detail=f"scene {idx + 1} re-recorded, verified {scenes[idx].verdict}, spliced in")
+                    elif any(r.id == "retake" and r.status == "running" for r in job.steps):
+                        step("retake", "skipped", detail=f"scene {idx + 1}: the retake was not better, kept the original")
+
+        # 5c. Assemble: intro and outro go in only now
+        async with _RENDER_SLOT:
+            clips = ([intro_path] if intro_path else []) + clips + ([outro_path] if outro_path else [])
             job.progress = 86
             log("Stitching scenes into demo.mp4...")
-            final_path = job_dir / "demo.mp4"
-            await concat_scenes(clips, final_path)
+            raw_path = job_dir / "demo_raw.mp4"
+            await concat_scenes(clips, raw_path)
+
+        # 5d. Soundtrack: a short grace for a late track, then the ducked mix; the raw cut ships on any failure
+        final_path = job_dir / "demo.mp4"
+        if music_task is not None and not music_task.done():
+            log(f"Waiting up to {music.GRACE_SEC}s for the soundtrack from fal.ai...")
+        soundtrack = await music.finish(music_task, raw_path, final_path, log, on_skip=music_skipped)
+        if soundtrack:
+            storyboard.soundtrack = soundtrack
+            step("music", "done", detail=soundtrack)
 
         media = await describe_media(final_path)
         final_path = _publish(job_dir, job_id, final_path)  # demo.mp4 into storage; scratch removed
@@ -427,7 +598,7 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
         job.status = "completed"
     except Exception as exc:
         logger.exception("[%s] pipeline failed", job_id)
-        for pending in (kit_task, bookend_task, *background):
+        for pending in (kit_task, bookend_task, audience_task, *background):
             if pending and not pending.done():
                 pending.cancel()
         job.error = str(exc).strip() or type(exc).__name__
@@ -472,7 +643,8 @@ def create_pipeline_job(req: PipelineRequest, user_id: Optional[str] = None) -> 
     if req.language != "auto":
         options["language"] = req.language
     job = JobStatus(job_id=job_id, status="queued", progress=0, stage="queued", logs=["Job queued"],
-                    app_url=req.app_url, created_at=time.time(), options=options)
+                    app_url=req.app_url, created_at=time.time(), options=options,
+                    audience=audience.pending_brief(req.audience) if req.audience else None)
     JOBS[job_id] = job
     events = EVENTS[job_id] = JobEvents()
     events.emit("job", {"id": job_id, "mode": run_mode()})

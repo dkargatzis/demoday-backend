@@ -9,7 +9,9 @@ from urllib.parse import urlparse
 
 from app.services.gemini import GEMINI_TIMEOUT_SEC, generate_json  # noqa: F401 (re-exported)
 from app.config import GEMINI_MODEL, get_secret
+from app.models.audience import AudienceBrief
 from app.models.schemas import Action, LaunchKit, Scene, Storyboard
+from app.services import audience as audience_mod
 
 logger = logging.getLogger("demoday.planner")
 
@@ -182,14 +184,18 @@ def _inventory_lines(app_info: dict) -> str:
 
 async def generate_storyboard(
     repo_info: dict, app_info: dict, target_seconds: int = 60, voice_style: str = "energetic_tech",
-    repo_url: str = "", ai_clips: bool = False,
+    repo_url: str = "", ai_clips: bool = False, audience: Optional[AudienceBrief] = None,
+    title_cards: bool = False, want_music: bool = False,
 ) -> Tuple[Storyboard, str]:
     """Returns (storyboard, human-readable note on which planner produced it).
 
-    With `ai_clips`, the intro/outro take part of the runtime and Gemini also describes the shots for them.
+    With `ai_clips` or `title_cards`, the intro/outro take part of the runtime; Gemini also describes the AI shots
+    (`ai_clips`) or the art behind the typeset cards (`title_cards`, "cover_visual"). `want_music` asks for a
+    "music_prompt" for the soundtrack.
     """
     name = project_name(repo_info, app_info)
-    narrated_sec = target_seconds - TAIL_ALLOWANCE_SEC - (BOOKEND_ALLOWANCE_SEC if ai_clips else 0)
+    bookends_on = ai_clips or title_cards
+    narrated_sec = target_seconds - TAIL_ALLOWANCE_SEC - (BOOKEND_ALLOWANCE_SEC if bookends_on else 0)
     total_words = max(30, int(narrated_sec * WORDS_PER_SECOND.get(voice_style, 2.4)))
     pages = [page for page in app_info.get("pages") or [] if not _flagged(page)]  # flagged ones stay on the site map
     site_map = _site_map_lines(app_info)
@@ -213,6 +219,22 @@ async def generate_storyboard(
    film behind those cards. Evoke the product's domain with abstract or atmospheric imagery and slow camera motion.
    They must contain no text, letters, logos, screens, user interfaces or people."""
         bookend_json = ' "intro_visual": "...", "outro_visual": "...",'
+    elif title_cards:
+        bookend_rule = f"""
+7. The video opens with an intro card that already introduces {name} by name and closes with an outro card showing
+   the URL, so scene 1 starts with the problem and the last scene doesn't repeat the URL. Also write "cover_visual":
+   one or two sentences of art direction for one still image an image model will paint behind both cards. Evoke the
+   product's domain with abstract shapes, light, materials and colour. It must contain no text, letters, numbers,
+   logos, screens, user interfaces or people."""
+        bookend_json = ' "cover_visual": "...",'
+    music_rule = music_json = ""
+    if want_music:
+        music_rule = """
+   "music_prompt": one sentence describing instrumental background music for this demo for a music model: genre,
+   mood, tempo and two or three instruments that fit the product and the tone; no vocals, no artist or song names."""
+        music_json = ' "music_prompt": "...",'
+    audience_block = audience_mod.prompt_section(audience)  # "" for None: the generic prompt stays byte-identical
+    audience_rule = audience_mod.storyboard_rule(audience)
     prompt = f"""You are directing a {target_seconds}-second product demo video for a hackathon submission.
 A headless browser (1920x1080) performs your actions on the LIVE app while a voiceover reads your narration.
 
@@ -233,7 +255,7 @@ INTERACTIVE ELEMENTS ON THE LIVE APP (selectors are verified, use them verbatim;
 {_inventory_lines(app_info)}
 
 SITE MAP: PAGES VISITED WHILE PREPARING THIS BRIEF (each route is reachable; "shows" lists the page's headings)
-{site_map or "- (only the landing page was reachable)"}
+{site_map or "- (only the landing page was reachable)"}{audience_block}
 
 RULES
 1. {scene_rule}
@@ -256,11 +278,11 @@ RULES
 5. The browser may be signed in to the user's real account: never sign out, delete, remove, cancel, purchase,
    or change settings. Show, don't modify.
 6. Respond with JSON only:
-{{"project_name": "{name}", "tagline": "one punchy line",{bookend_json} "plan_rationale": "...", "scenes": [{{"id": "scene-1",
+{{"project_name": "{name}", "tagline": "one punchy line",{bookend_json}{music_json} "plan_rationale": "...", "scenes": [{{"id": "scene-1",
   "title": "...", "route": "/", "why": "...", "narration": "...", "actions": [{{"type": "scroll", "value": "down", "dwell_ms": 1500}}]}}]}}
    "plan_rationale": one sentence, spoken to the founder, on why these pages in this order (for example: Opening on
    the benchmark page because the README leads with performance). Each scene's "why": <= 20 words on what this
-   scene proves about the product.{bookend_rule}
+   scene proves about the product.{music_rule}{bookend_rule}{audience_rule}
 """
     if get_secret("GEMINI_API_KEY"):
         try:
@@ -306,7 +328,10 @@ def _sanitize_storyboard(data: Any, fallback_name: str) -> Storyboard:
         scenes=scenes[:6],
         intro_visual=_clean_narration(data.get("intro_visual"))[:400] or None,
         outro_visual=_clean_narration(data.get("outro_visual"))[:400] or None,
+        audience_note=_clean_narration(data.get("audience_note"))[:200] or None,
         plan_rationale=_clean_narration(data.get("plan_rationale"))[:200] or None,
+        cover_visual=_clean_narration(data.get("cover_visual"))[:400] or None,
+        music_prompt=_clean_narration(data.get("music_prompt"))[:300] or None,
     )
 
 
@@ -360,6 +385,7 @@ def _template_storyboard(repo_info: dict, app_info: dict) -> Storyboard:
 
 async def generate_launch_kit(
     storyboard: Storyboard, repo_info: dict, app_info: dict, repo_url: str, app_url: str,
+    audience: Optional[AudienceBrief] = None,
 ) -> Tuple[LaunchKit, str]:
     """Returns (launch kit, human-readable note on which generator produced it)."""
     name, tagline = storyboard.project_name, storyboard.tagline
@@ -377,7 +403,7 @@ README excerpt:
 {repo_info.get('readme', '')[:3000]}
 >>>
 Demo video narration:
-{narration}
+{narration}{audience_mod.launch_kit_section(audience)}
 
 Return JSON with exactly these keys:
 - "readme_markdown": a polished GitHub README in Markdown: title and tagline, links to the live demo and repo,
@@ -390,14 +416,17 @@ Return JSON with exactly these keys:
 """
     if get_secret("GEMINI_API_KEY"):
         try:
-            return _sanitize_launch_kit(await _generate_json(prompt, purpose="launch kit")), f"Launch kit written by Gemini ({GEMINI_MODEL})"
+            data = await _generate_json(prompt, purpose="launch kit")
+            kit = _sanitize_launch_kit(data)
+            return kit, (f"Launch kit written by Gemini ({GEMINI_MODEL})"
+                         + audience_mod.attach_outreach(kit, data, audience, storyboard, app_url))
         except Exception as exc:
             logger.warning("Gemini launch kit failed: %s", exc)
             reason = f"Gemini ({GEMINI_MODEL}) failed: {_failure_reason(exc)}"
     else:
         reason = "GEMINI_API_KEY not set"
     kit = _template_launch_kit(storyboard, repo_info, app_info, repo_url, app_url)
-    return kit, f"{reason}: template launch kit fallback"
+    return kit, f"{reason}: template launch kit fallback" + audience_mod.attach_outreach(kit, None, audience, storyboard, app_url)
 
 
 def _sanitize_launch_kit(data: Any) -> LaunchKit:

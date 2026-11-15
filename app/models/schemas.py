@@ -4,6 +4,8 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.models.audience import Audience, AudienceBrief, AudienceGoal, OutreachEmail  # noqa: F401 (re-exported)
+
 GOALS = ("social", "community", "investors", "customers")  # Launch Kit v2 contract (backend issue #3)
 LANGUAGE_RE = re.compile(r"^[A-Za-z]{2,3}(-[A-Za-z]{2,4})?$")
 
@@ -34,6 +36,8 @@ class PipelineRequest(BaseModel):
                                          "Echoed as `options.goals` on the job; the demo recording runs regardless")
     language: str = Field(default="auto", description='Run language: "auto" or a code such as "en", "el", "de". '
                                                        "Echoed as `options.requestedLanguage`")
+    audience: Optional[Audience] = Field(default=None,
+                                         description="Personalize this demo for one customer; omitted = the generic demo")
 
     @field_validator("goals")
     @classmethod
@@ -107,6 +111,7 @@ class Storyboard(BaseModel):
     outro_sec: float = 0.0
     intro_visual: Optional[str] = None  # Gemini's shot descriptions for the AI clips
     outro_visual: Optional[str] = None
+    audience_note: Optional[str] = Field(default=None, description="Why these pages, in this order, for this viewer")
     plan_rationale: Optional[str] = Field(default=None, description="Why these pages in this order (one sentence)")
     music_prompt: Optional[str] = Field(default=None, description="Gemini's brief for the fal.ai soundtrack")
     cover_visual: Optional[str] = Field(default=None, description="Gemini's brief for the fal.ai cover art")
@@ -119,6 +124,8 @@ class LaunchKit(BaseModel):
     devpost_pitch: str
     x_thread: List[str]
     linkedin_post: str
+    outreach_email: Optional[OutreachEmail] = Field(default=None, description="Personalized runs only; body carries {{DEMO_LINK}} once")
+    linkedin_dm: Optional[str] = Field(default=None, description="Personalized runs only; carries {{DEMO_LINK}} once")
 
 
 class StepState(BaseModel):
@@ -159,6 +166,8 @@ class JobStatus(BaseModel):
     created_at: Optional[float] = Field(default=None, description="Unix time the job was accepted")
     options: Dict[str, Any] = Field(default_factory=dict,
                                     description="Request options echoed for the kit contract: goals, requestedLanguage")
+    audience: Optional[AudienceBrief] = Field(default=None, description="The customer brief of a personalized run "
+                                                                        "(source 'pending' until research finishes)")
     steps: List[StepState] = Field(default_factory=list, description="The agent trace, one row per pipeline step")
     tool_calls: List[ToolCall] = Field(default_factory=list, description="Every Gemini and fal.ai call, with latency")
 
@@ -175,6 +184,10 @@ class JobSummary(BaseModel):
     createdAt: Optional[str] = Field(default=None, description="ISO 8601, UTC")
     productName: Optional[str] = None
     status: Literal["completed", "failed"]
+    customer: Optional[str] = Field(default=None, description="Company of a personalized run")
+    persona: Optional[str] = None
+    customerGoal: Optional[str] = None
+    durationSec: Optional[float] = None
 
 
 class ErrorMessage(BaseModel):
