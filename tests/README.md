@@ -11,6 +11,7 @@ servers. Each is a plain script that prints one line per check and exits 1 on a 
 
 | Suite | Covers |
 | --- | --- |
+| `check_analysis.py` | The prospect analysis: which files are read (roles, quotas, per-folder cap; tests, builds and vendored code skipped), the byte budget, private repositories through the contents API, the prompt, the sanitizer, the Gemini call and `POST /api/pipeline/analyze` |
 | `check_api.py` | CORS for the dashboard (3000) and Launch Kit (3780); `GET /api/pipeline/cover/{id}` (session, ownership, 404 until painted); `coverUrl` in `GET /api/jobs`; `_publish` keeping `cover.jpg` next to `demo.mp4`; the planner asking for the poster's art direction without adding title cards |
 | `check_audience.py` | Personalized demos: the models, prospect research against a fake site, the brief, the planner and launch-kit sections, the "Made for" cards, the outreach email and DM. Includes the four review cases: without an audience the prompts are byte-identical, an audience without a website, a website that times out, a private address refused before any fetch |
 | `check_bookends.py` | Title cards and the cover poster: the product's own screen in a browser frame (checked by pixel), the FLUX fallback (cards rendered before the image call, the product name never sent to the image model; FLUX failure, timeout, no key, `FEATURE_COVER=0`), `prepare_poster` |

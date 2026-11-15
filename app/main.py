@@ -5,7 +5,7 @@ import os
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Dict, List
+from typing import Dict, List, Literal
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
@@ -25,7 +25,7 @@ from app.services import cloud, fixtures
 from app.services.capture import CAPTURES, indexed_db_records, origin_of, unpack_login
 from app.services.capture import VIEWPORT as CAPTURE_VIEWPORT
 from app.services.netguard import BlockedURL, ensure_public_url
-from app.services.orchestrator import JOBS, create_pipeline_job, stream_job_events
+from app.services.orchestrator import JOBS, create_analysis_job, create_pipeline_job, stream_job_events
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)  # one INFO line per outbound request is noise
@@ -196,9 +196,23 @@ async def start_pipeline(req: PipelineRequest, user: Dict = Depends(auth.current
     return JobStarted(**job.model_dump(), jobId=job.job_id)
 
 
+@app.post("/api/pipeline/analyze", response_model=JobStarted, status_code=202, tags=["pipeline"],
+          summary="Analyze the product for one prospect (step 1 of 2: no video)",
+          responses={401: {"model": ErrorDetail},
+                     422: {"model": ErrorMessage, "description": "Invalid request (a non-http URL, a bad website, ...)"}})
+async def start_analysis(req: PipelineRequest, user: Dict = Depends(auth.current_user)):
+    """Reads the repositories (a deep read of their code), the live app and the prospect's site, then returns
+    `analysis` on the job: features, the strongest funnels for this prospect with demo steps, and the gaps they would
+    notice. Follow it like a video job (`/api/pipeline/events/{id}`, `GET /api/jobs/{id}`); start the video with
+    `POST /api/pipeline/start` and the chosen funnel's `demo_steps` as `instructions`."""
+    job = create_analysis_job(req, user_id=user["id"])
+    return JobStarted(**job.model_dump(), jobId=job.job_id)
+
+
 @app.get("/api/jobs", response_model=List[JobSummary], tags=["jobs"], summary="Your recent finished jobs, newest first",
          responses={401: {"model": ErrorDetail}})
-async def list_jobs(user: Dict = Depends(auth.current_user), limit: int = Query(20, ge=1, le=100)):
+async def list_jobs(user: Dict = Depends(auth.current_user), limit: int = Query(20, ge=1, le=100),
+                    kind: Literal["video", "analysis", "all"] = Query("video", description="Videos (default), analyses or both")):
     rows = db.query("SELECT id FROM jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT ?", (user["id"], limit * 3))
     summaries: List[JobSummary] = []
     for row in rows:
@@ -206,7 +220,7 @@ async def list_jobs(user: Dict = Depends(auth.current_user), limit: int = Query(
             job = _job_for(row["id"], user)
         except HTTPException:
             continue  # lost in a server restart
-        if job.status not in ("completed", "failed"):
+        if job.status not in ("completed", "failed") or (kind != "all" and job.kind != kind):
             continue
         created = datetime.fromtimestamp(job.created_at, timezone.utc).isoformat() if job.created_at else None
         summaries.append(JobSummary(id=job.job_id, url=job.app_url, createdAt=created, status=job.status,
@@ -215,7 +229,7 @@ async def list_jobs(user: Dict = Depends(auth.current_user), limit: int = Query(
                                     persona=job.audience.persona if job.audience else None,
                                     customerGoal=job.audience.goal if job.audience else None,
                                     durationSec=job.storyboard.total_duration_sec if job.storyboard else None,
-                                    coverUrl=job.cover_url))
+                                    coverUrl=job.cover_url, kind=job.kind))
         if len(summaries) >= limit:
             break
     return summaries

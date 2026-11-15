@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 
 from app import db, vault
 from app.config import capabilities, feature_on, get_secret, storage_root, work_root
+from app.services import analysis as analysis_mod
 from app.services import funnels as funnels_mod
 from app.services import ledger, music, plancheck, review, vision
 from app.models.schemas import JobStatus, PipelineRequest, StepState
@@ -40,14 +41,14 @@ STEP_LABELS = {
     "repos": "Reading the repositories", "scrape": "Exploring the live app", "audience": "Researching the customer",
     "understand": "Understanding the pages", "storyboard": "Planning the storyboard", "plancheck": "Checking the plan",
     "launchpack": "Writing the launch kit", "ai_clips": "AI intro and outro", "cover": "Making the cover and title cards",
-    "funnels": "Finding the strongest funnels",
+    "funnels": "Finding the strongest funnels", "code": "Reading the code", "analysis": "Analyzing for the prospect",
     "music": "Composing the soundtrack", "narration": "Synthesizing narration", "record": "Recording the browser session",
     "review": "Reviewing the footage", "retake": "Retaking a scene", "video": "Assembling demo.mp4",
 }
 STEP_TOOLS = {
     "repos": "github", "scrape": "chromium", "audience": "gemini", "understand": "gemini", "storyboard": "gemini",
     "plancheck": "gemini", "launchpack": "gemini", "ai_clips": "fal", "cover": "fal", "music": "fal", "narration": "fal",
-    "funnels": "gemini",
+    "funnels": "gemini", "code": "github", "analysis": "gemini",
     "record": "chromium", "review": "gemini", "retake": "chromium", "video": "ffmpeg",
 }
 
@@ -229,19 +230,7 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
     bookend_mode: Optional[str] = None
     background: List[asyncio.Task] = []  # optional work (warm-up, cover, music, review): cancelled before completion
     job_dir: Optional[Path] = None
-
-    async def _optional(awaitable, timeout: float, step_id: str, what: str):
-        """Runs an optional agent step with a hard timeout; a failure costs one log line and never the demo."""
-        try:
-            return await asyncio.wait_for(awaitable, timeout)
-        except asyncio.CancelledError:
-            raise
-        except BaseException as exc:  # noqa: BLE001 - optional steps must never take the job down
-            reason = "took too long" if isinstance(exc, asyncio.TimeoutError) else (str(exc).strip().splitlines() or [type(exc).__name__])[0]
-            logger.warning("[%s] %s skipped: %s", job_id, what, reason, exc_info=not isinstance(exc, asyncio.TimeoutError))
-            log(f"{what} skipped: {reason[:140]}")
-            step(step_id, "error", message=reason[:140])
-            return None
+    _optional = _optional_runner(job_id, log, step)
 
     try:  # everything, including setup, must land in a terminal state or the job hangs in "running"
         job_dir = work_root() / job_id  # intermediates; the results are copied to storage_root()/job_id
@@ -765,7 +754,161 @@ def _publish(job_dir: Path, job_id: str, final_path: Path, poster: Optional[Path
     return target
 
 
-def create_pipeline_job(req: PipelineRequest, user_id: Optional[str] = None) -> JobStatus:
+def _optional_runner(job_id: str, log: Callable[[str], None], step: "_Steps"):
+    """`await _optional(awaitable, timeout, step_id, what)`: an optional agent step with a hard timeout; a failure
+    costs one log line and an error row, never the job."""
+    async def _optional(awaitable, timeout: float, step_id: str, what: str):
+        try:
+            return await asyncio.wait_for(awaitable, timeout)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # noqa: BLE001 - optional steps must never take the job down
+            reason = "took too long" if isinstance(exc, asyncio.TimeoutError) else (str(exc).strip().splitlines() or [type(exc).__name__])[0]
+            logger.warning("[%s] %s skipped: %s", job_id, what, reason, exc_info=not isinstance(exc, asyncio.TimeoutError))
+            log(f"{what} skipped: {reason[:140]}")
+            step(step_id, "error", message=reason[:140])
+            return None
+    return _optional
+
+
+async def run_analysis_task(job_id: str, req: PipelineRequest, user_id: Optional[str] = None) -> None:
+    """Step 1 of 2 for a prospect demo: the repositories (and a deep read of their code), the live app, the prospect's
+    site and the page screenshots, then one Gemini analysis: features, the strongest funnels for this prospect with
+    demo steps, and the gaps they would notice. No narration, recording or video; the founder confirms a funnel and
+    starts the video with its steps as `instructions`."""
+    job = JOBS[job_id]
+    ledger.bind(job)
+    events = EVENTS.get(job_id) or EVENTS.setdefault(job_id, JobEvents())
+    log = _job_logger(job, events)
+    started = time.monotonic()
+    step = _Steps(events, job, started)
+    _optional = _optional_runner(job_id, log, step)
+    job.status = "running"
+    audience_task: Optional[asyncio.Task] = None
+    job_dir: Optional[Path] = None
+    try:
+        job_dir = work_root() / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            await ensure_public_url(req.app_url)
+        except BlockedURL as exc:
+            raise RuntimeError(str(exc)) from None
+        github_token, storage_state = _user_secrets(user_id, req, log)
+        replayer = None
+        if user_id and req.use_staged_data:
+            fixture_set = get_set_for_origin(user_id, origin_of(req.app_url))
+            if fixture_set and fixture_set["enabled_count"]:
+                replayer = FixtureReplayer(fixture_set["entries"])
+        if req.audience:
+            step("audience", "running", detail=audience.running_detail(req.audience))
+            audience_task = asyncio.create_task(audience.build_audience(req.audience, req.target_seconds, log, req.app_url))
+        else:
+            step("audience", "skipped", detail="No prospect in this analysis")
+        if req.instructions:
+            log("Your focus for the analysis: \"" + " / ".join(req.instructions.splitlines())[:240] + "\"")
+
+        job.stage, job.progress = "ingesting", 5
+        step("repos", "running" if req.repo_urls else "skipped",
+             detail=f"{len(req.repo_urls)} repositor{'y' if len(req.repo_urls) == 1 else 'ies'}" if req.repo_urls
+             else "No repositories in this analysis")
+        step("scrape", "running", detail=req.app_url)
+        shots_dir = job_dir / "shots"
+        repo_info, app_info = await asyncio.gather(
+            extract_repos_context(req.repo_urls, github_token),
+            probe_app_url(req.app_url, storage_state, replayer, shots_dir=shots_dir if feature_on("VISION") else None,
+                          focus=req.instructions,
+                          on_page=lambda p: log(f"Explored {p['path']}: '{p['title']}' ({len(p['headings'])} headings)")),
+        )
+        if app_info.get("error"):
+            raise RuntimeError(f"Navigation to {req.app_url} failed: {app_info['error']}")
+        for note in repo_info.get("notes", []):
+            log(note)
+        if req.repo_urls:
+            step("repos", "done", detail=f"{len(repo_info.get('repos', []))} of {len(req.repo_urls)} read, "
+                                        f"{len(repo_info.get('routes', []))} routes")
+        pages = app_info.get("pages") or []
+        step("scrape", "done", detail=f"HTTP {app_info.get('status')}: {app_info.get('title') or 'untitled'}; "
+                                      f"{len(pages) + 1} page(s) explored")
+        landed = app_info.get("url") or req.app_url
+        if _path_of(landed) != _path_of(req.app_url):
+            log(f"Warning: {req.app_url} redirected to {landed}. "
+                + ("Your saved login may have expired: open Settings, choose \"Sign in again\", then re-run."
+                   if storage_state else "This page may need a login: save an app login in Settings."))
+        job.progress = 25
+
+        sources = repo_info.get("sources") or []
+        code: List[Dict[str, str]] = []
+        if sources:
+            step("code", "running", detail=f"{len(sources)} repositor{'y' if len(sources) == 1 else 'ies'}: navigation, "
+                                           "UI copy, pages, APIs, models")
+            code = await _optional(analysis_mod.read_code(sources, github_token, log), analysis_mod.READ_TIMEOUT_SEC,
+                                   "code", "Code reading") or []
+            if code:
+                step("code", "done", detail=f"{len(code)} files, {sum(len(f['text']) for f in code) / 1000:.0f} kB")
+        else:
+            step("code", "skipped", detail="No readable repository")
+        brief = None
+        if audience_task is not None:
+            brief = await audience_task
+            job.audience = brief
+            step("audience", "done", detail=audience.step_detail(brief))
+        job.progress = 45
+
+        shots = [p for p in [app_info.get("screenshot"), *(pg.get("screenshot") for pg in pages)] if p]
+        if feature_on("VISION") and get_secret("GEMINI_API_KEY") and shots:
+            step("understand", "running", detail=f"{len(shots)} screenshots → Gemini")
+            insights = await _optional(vision.describe_pages(app_info, log), 20, "understand", "Understand")
+            if insights:
+                await vision.thumbnails(insights)
+                step("understand", "done", detail=" · ".join(f"{i['path']}: {i['purpose']}" for i in insights)[:200],
+                     extra={"pages": insights})
+        job.progress = 60
+
+        job.stage = "analysis"
+        project = project_name(repo_info, app_info)
+        if not get_secret("GEMINI_API_KEY"):
+            raise RuntimeError("The analysis needs Gemini: GEMINI_API_KEY is not set")
+        step("analysis", "running", detail=f"{len(code)} files and {len(pages) + 1} pages"
+                                           + (f" for {brief.company}" if brief is not None else ""))
+        log(f"Gemini is analyzing {project}" + (f" for {brief.company}" if brief is not None else "") + "...")
+        result = await analysis_mod.analyze(project, repo_info, app_info, code, brief, req.instructions)
+        job.analysis = result
+        step("analysis", "done", detail=analysis_mod.step_detail(result))
+        log(analysis_mod.summary_line(result))
+
+        job.stage, job.progress = "completed", 100
+        ledger.seal(job)
+        log("Tools used: " + ledger.summary(job))
+        log(f"Analysis ready in {time.monotonic() - started:.0f}s: pick a funnel to make its video.")
+        job.status = "completed"
+    except Exception as exc:
+        logger.exception("[%s] analysis failed", job_id)
+        if audience_task is not None and not audience_task.done():
+            audience_task.cancel()
+        job.error = str(exc).strip() or type(exc).__name__
+        log(f"Analysis failed: {job.error}")
+        step.fail(job.error)
+        ledger.seal(job)
+        job.status = "failed"
+    if job_dir is not None:
+        try:
+            result_dir = storage_root() / job_id
+            result_dir.mkdir(parents=True, exist_ok=True)
+            (result_dir / "job.json").write_text(job.model_dump_json(indent=2))
+        except OSError as exc:
+            logger.warning("[%s] could not write job.json: %s", job_id, exc)
+        if job_dir != storage_root() / job_id:
+            shutil.rmtree(job_dir, ignore_errors=True)  # Cloud Run: scratch on local disk, job.json on the bucket
+        else:
+            shutil.rmtree(job_dir / "shots", ignore_errors=True)  # local: the scratch dir is the result dir
+
+
+def create_analysis_job(req: PipelineRequest, user_id: Optional[str] = None) -> JobStatus:
+    """A prospect analysis job (kind "analysis"): the same events, steps and job endpoints as a video job."""
+    return create_pipeline_job(req, user_id=user_id, kind="analysis")
+
+
+def create_pipeline_job(req: PipelineRequest, user_id: Optional[str] = None, kind: str = "video") -> JobStatus:
     job_id = uuid.uuid4().hex[:12]
     options: Dict[str, Any] = {"goals": req.goals, "requestedLanguage": req.language}
     if req.language != "auto":
@@ -773,14 +916,15 @@ def create_pipeline_job(req: PipelineRequest, user_id: Optional[str] = None) -> 
     if req.instructions:
         options["instructions"] = req.instructions
     job = JobStatus(job_id=job_id, status="queued", progress=0, stage="queued", logs=["Job queued"],
-                    app_url=req.app_url, created_at=time.time(), options=options,
+                    app_url=req.app_url, created_at=time.time(), options=options, kind=kind,
                     audience=audience.pending_brief(req.audience) if req.audience else None)
     JOBS[job_id] = job
     events = EVENTS[job_id] = JobEvents()
     events.emit("job", {"id": job_id, "mode": run_mode()})
     if user_id:
         db.execute("INSERT INTO jobs (id, user_id, created_at) VALUES (?, ?, ?)", (job_id, user_id, job.created_at))
-    for coro in (run_pipeline_task(job_id, req, user_id), _watch_job(job, events)):
+    runner = run_analysis_task if kind == "analysis" else run_pipeline_task
+    for coro in (runner(job_id, req, user_id), _watch_job(job, events)):
         task = asyncio.create_task(coro)
         _TASKS.add(task)
         task.add_done_callback(_TASKS.discard)

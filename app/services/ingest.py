@@ -81,6 +81,9 @@ async def extract_repos_context(repo_urls: List[str], token: Optional[str] = Non
                         "description": info.get("description", ""), "language": info.get("language", "")}
                        for url, info in zip(urls, infos)]
     merged["notes"] = [note for info in infos for note in info.get("notes", [])]
+    merged["sources"] = [{"owner": info.get("owner"), "repo": info.get("repo"), "full_name": info.get("full_name"),
+                          "branch": info.get("branch"), "tree": info.get("tree") or [], "flow_files": info.get("flow_files") or []}
+                         for info in infos if info.get("tree")]  # per repository, for analysis.read_code
     return merged
 
 
@@ -155,7 +158,10 @@ async def extract_github_context(repo_url: str, token: Optional[str] = None) -> 
         readme, tree = await asyncio.gather(readme_task, tree_task or _none())
         info["readme"] = _clean_readme(readme)
 
-        paths = [item["path"] for item in (tree or {}).get("tree", []) if item.get("type") == "blob"]
+        blobs = [item for item in (tree or {}).get("tree", []) if item.get("type") == "blob"]
+        paths = [item["path"] for item in blobs]
+        info["branch"] = branch
+        info["tree"] = [(item["path"], int(item.get("size") or 0)) for item in blobs[:30000]]  # for the code reading
         info["routes"] = derive_routes(paths)
         info["flow_files"] = flow_files(paths)
         manifests = [m for m in MANIFESTS if m in paths] if paths else list(MANIFESTS)

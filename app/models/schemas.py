@@ -183,6 +183,10 @@ class JobStatus(BaseModel):
     audience: Optional[AudienceBrief] = Field(default=None, description="The customer brief of a personalized run "
                                                                         "(source 'pending' until research finishes)")
     steps: List[StepState] = Field(default_factory=list, description="The agent trace, one row per pipeline step")
+    kind: Literal["video", "analysis"] = Field(default="video", description="A demo video, or a prospect analysis "
+                                                                              "(step 1 of 2: no video)")
+    analysis: Optional[Dict[str, Any]] = Field(default=None, description="The prospect analysis: summary, features, "
+                                                                          "funnels (with demo_steps), gaps, files_read")
     tool_calls: List[ToolCall] = Field(default_factory=list, description="Every Gemini and fal.ai call, with latency")
 
 
@@ -203,6 +207,7 @@ class JobSummary(BaseModel):
     customerGoal: Optional[str] = None
     durationSec: Optional[float] = None
     coverUrl: Optional[str] = Field(default=None, description="The cover poster, when one was painted")
+    kind: Literal["video", "analysis"] = "video"
 
 
 class ErrorMessage(BaseModel):

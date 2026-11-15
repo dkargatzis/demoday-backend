@@ -62,6 +62,7 @@ videos and saved credentials are only visible to their owner.
 | `GET /api/pipeline/events/{job_id}` | SSE stream of full job snapshots (`/stream/{job_id}` is an alias) |
 | `GET /api/pipeline/status/{job_id}` | Current job snapshot (finished jobs reload from `job.json` after a restart) |
 | `GET /api/pipeline/video/{job_id}` | The MP4 (supports range requests; `?download=1` for an attachment) |
+| `POST /api/pipeline/analyze` | Step 1 of 2 for a prospect demo: the same body as a start; the job (`kind: "analysis"`) ends with `analysis`: the pitch, features, the strongest funnels for the prospect with `demo_steps`, and the gaps |
 | `GET /api/pipeline/cover/{job_id}` | The cover poster, a 1280x720 JPEG for `<video poster>` (`job.cover_url`); 404 until it is painted |
 | `GET /api/jobs`; `GET /api/jobs/{job_id}` | Your recent finished jobs (camelCase rows with `coverUrl`); one job, the same object as the `done` event |
 | `GET /api/settings`; `PUT`/`DELETE /api/settings/github-token` | GitHub token for private repositories (validated with GitHub, stored encrypted) |
@@ -87,6 +88,19 @@ from Gemini's art direction instead. The name is the brand, not the repository: 
 that matches its domain ("... | Warestack" on warestack.com), then the repository's name unless it only says what the
 code is (`core-api`). The 1280x720 JPEG is served at `GET /api/pipeline/cover/{job_id}` for `<video poster>`. On a
 personalized run the poster is the "Made for" intro card; a generic run gets no intro or outro cards.
+
+### Prospect analysis (step 1 of 2)
+
+Before any video, `POST /api/pipeline/analyze` (the dashboard's "Analyze a prospect" page) reads the product for one
+prospect: the repositories' README and routes plus a deep read of the files that say most about the product (navigation,
+English UI copy, the changelog, page components, API routers, data models and feature modules, up to 60 files and about
+220 kB, never tests, builds or vendored code; private repositories through the saved GitHub token), the live app with its
+saved login, the prospect's public site and the page screenshots. One Gemini call (high thinking, structured output)
+returns the pitch, what the product does today (each feature tied to a file or a page), up to three funnels for this
+prospect (every step a page the probe reached, with "why them", the evidence and plain-words `demo_steps`) and up to six
+gaps they would notice (a missing feature or page, an API without a page, a weak page), each with its evidence and the
+smallest change that would close it. Step 2 is an ordinary video job with the chosen funnel's steps as `instructions`;
+it is addressed to the prospect only when you ask. Analyses stay out of `GET /api/jobs` unless `kind=analysis`.
 
 ### What to show
 
