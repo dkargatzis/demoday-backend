@@ -4,6 +4,7 @@ Every engine's output is normalized to 48 kHz stereo PCM WAV, and the returned d
 with ffprobe so the browser recording can be timed to the real narration length.
 """
 import asyncio
+import os
 import base64
 import logging
 import shutil
@@ -22,7 +23,9 @@ logger = logging.getLogger("demoday.audio")
 
 # fal.ai's PlayHT endpoints were retired (404); Kokoro is fal-hosted. Schema: prompt/voice/speed -> audio.url
 FAL_TTS_ENDPOINT = "fal-ai/kokoro/american-english"
-FAL_TTS_TIMEOUT_SEC = 60  # a short clip; when fal.ai is backed up, fall back sooner rather than wait 2 minutes
+# How long to wait for fal.ai per clip before falling back (Google Cloud TTS / local). fal's Kokoro queue can take
+# 1-2 minutes to spin a worker up when it has gone cold; warm_up_fal() starts that early in the job.
+FAL_TTS_TIMEOUT_SEC = int(os.getenv("FAL_TTS_TIMEOUT_SEC", "90"))
 
 # voice_style -> (Kokoro voice, Kokoro speed, local TTS words-per-minute)
 VOICE_PRESETS = {
@@ -52,7 +55,9 @@ async def synthesize_scene_audio(text: str, output_path, voice_style: str = "ene
                 engine = f"fal.ai Kokoro ({voice}, {speed}x)"
             except Exception as exc:
                 logger.warning("fal.ai TTS failed: %s", exc)
-                engine = f"fal.ai unavailable ({_short(exc)}) → "
+                reason = (f"no answer within {FAL_TTS_TIMEOUT_SEC}s, its queue is slow" if "timed out" in str(exc)
+                          else _short(exc))
+                engine = f"fal.ai {reason} → "
         if raw is None and cloud.google_tts_enabled():  # Google Cloud Chirp 3 HD (no key: runtime credentials)
             try:
                 raw = await cloud.google_tts(text, tmp_dir / "google.wav", voice_style)
@@ -74,6 +79,21 @@ async def synthesize_scene_audio(text: str, output_path, voice_style: str = "ene
                           "-ar", str(AUDIO_RATE), "-ac", "2", "-c:a", "pcm_s16le", str(output_path)])
 
     return await probe_duration(output_path), engine
+
+
+async def warm_up_fal() -> None:
+    """Fire-and-forget: asks fal.ai for a one-word clip so its worker is warm by the time narration is needed."""
+    key = get_secret("FAL_KEY")
+    if not key:
+        return
+    try:
+        import fal_client
+
+        client = fal_client.AsyncClient(key=key)
+        await client.subscribe(FAL_TTS_ENDPOINT, arguments={"prompt": "Ready.", "voice": "af_heart", "speed": 1.0},
+                               client_timeout=300)
+    except Exception as exc:
+        logger.info("fal.ai warm-up did not complete: %s", _short(exc))
 
 
 async def _fal_tts(text: str, tmp_dir: Path, voice: str, speed: float, key: str) -> Path:

@@ -11,7 +11,7 @@ from typing import AsyncGenerator, Callable, Dict, Optional, Set, Tuple
 from app import db, vault
 from app.config import get_secret, storage_root, work_root
 from app.models.schemas import JobStatus, PipelineRequest
-from app.services.audio import synthesize_scene_audio
+from app.services.audio import synthesize_scene_audio, warm_up_fal
 from app.services.bookends import FAL_VIDEO_MODEL, prepare_bookends
 from app.services.capture import origin_of
 from app.services.fixtures import FixtureReplayer, get_set_for_origin
@@ -77,6 +77,9 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
         except BlockedURL as exc:
             raise RuntimeError(str(exc)) from None
         github_token, storage_state = _user_secrets(user_id, req, log)
+        warm_task = asyncio.create_task(warm_up_fal())  # fal.ai's queue warms up while we ingest and plan
+        _TASKS.add(warm_task)
+        warm_task.add_done_callback(_TASKS.discard)
         replayer = None
         if user_id and req.use_staged_data:
             fixture_set = get_set_for_origin(user_id, origin_of(req.app_url))
