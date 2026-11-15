@@ -58,7 +58,7 @@ videos and saved credentials are only visible to their owner.
 | --- | --- |
 | `GET /api/health` | Status plus capabilities (`ffmpeg`, `gemini`, `fal`, `gemini_model`, `vault`, `signup_code`) |
 | `POST /api/auth/signup`, `/login`, `/logout`; `GET /api/auth/me` | Accounts and sessions |
-| `POST /api/pipeline/start` | Start a job: `{repo_urls[], app_url, voice_style, target_seconds, use_app_login, ai_clips, use_staged_data}` (`repo_url` still accepted) |
+| `POST /api/pipeline/start` | Start a job: `{repo_urls[], app_url, voice_style, target_seconds, use_app_login, ai_clips, use_staged_data, instructions?, audience?}` (`repo_url` still accepted) |
 | `GET /api/pipeline/events/{job_id}` | SSE stream of full job snapshots (`/stream/{job_id}` is an alias) |
 | `GET /api/pipeline/status/{job_id}` | Current job snapshot (finished jobs reload from `job.json` after a restart) |
 | `GET /api/pipeline/video/{job_id}` | The MP4 (supports range requests; `?download=1` for an attachment) |
@@ -87,6 +87,15 @@ from Gemini's art direction instead. The name is the brand, not the repository: 
 that matches its domain ("... | Warestack" on warestack.com), then the repository's name unless it only says what the
 code is (`core-api`). The 1280x720 JPEG is served at `GET /api/pipeline/cover/{job_id}` for `<video poster>`. On a
 personalized run the poster is the "Made for" intro card; a generic run gets no intro or outro cards.
+
+### What to show
+
+`instructions` (up to 1000 characters, the dashboard's "What to show" field) is the founder's own steps, for example
+"Open Rules and enable 'Require a linked ticket', then open Events and show the pull request it blocked". The probe
+visits the links those words name first and follows them one level deeper, the funnel that does them ranks first, and
+the storyboard follows the steps in order (an action that changes data is allowed only when the steps ask for it; never
+signing out, deleting or purchasing). Without it the tour is the strongest funnel. A generic run never greets anyone
+or names a customer.
 
 ### Funnels
 

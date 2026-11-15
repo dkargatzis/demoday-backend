@@ -38,6 +38,18 @@ class PipelineRequest(BaseModel):
                                                        "Echoed as `options.requestedLanguage`")
     audience: Optional[Audience] = Field(default=None,
                                          description="Personalize this demo for one customer; omitted = the generic demo")
+    instructions: Optional[str] = Field(default=None, max_length=1000,
+                                        description="What the demo must show, in your own words: pages to open and actions "
+                                                    "to take, in order (\"Open Rules, enable 'Require a linked ticket', then "
+                                                    "open the pull request it blocked\"). The tour follows it, and the funnel "
+                                                    "that matches it ranks first. Echoed as `options.instructions`")
+
+    @field_validator("instructions")
+    @classmethod
+    def _plain_instructions(cls, value: Optional[str]) -> Optional[str]:
+        text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]+", " ", value or "")  # control characters out, line breaks kept
+        text = "\n".join(re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines())
+        return re.sub(r"\n{3,}", "\n\n", text).strip() or None
 
     @field_validator("goals")
     @classmethod

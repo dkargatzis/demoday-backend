@@ -231,7 +231,7 @@ async def generate_storyboard(
     repo_info: dict, app_info: dict, target_seconds: int = 60, voice_style: str = "energetic_tech",
     repo_url: str = "", ai_clips: bool = False, audience: Optional[AudienceBrief] = None,
     title_cards: bool = False, want_music: bool = False, want_cover: bool = False,
-    funnels: Optional[List[dict]] = None,
+    funnels: Optional[List[dict]] = None, instructions: Optional[str] = None,
 ) -> Tuple[Storyboard, str]:
     """Returns (storyboard, human-readable note on which planner produced it).
 
@@ -239,6 +239,7 @@ async def generate_storyboard(
     (`ai_clips`) or the art behind the typeset cards (`title_cards`, "cover_visual"). `want_music` asks for a
     "music_prompt" for the soundtrack, `want_cover` for a "cover_visual" for the poster (it takes no runtime).
     `funnels` (funnels.find_funnels, strongest first) adds the FUNNELS block and makes the tour follow the strongest.
+    `instructions` (the founder's own steps) adds the WHAT TO SHOW block, which decides the tour before the funnels.
     """
     name = project_name(repo_info, app_info)
     bookends_on = ai_clips or title_cards
@@ -257,7 +258,15 @@ async def generate_storyboard(
     else:
         scene_rule = "Write 4-5 scenes: hook, the problem or input, the core feature in action, the payoff, a closing call to action."
         open_rule = ""
-    scene_rule += funnels_mod.scene_rule(funnels, personalized=audience is not None)
+    if instructions:  # the founder's steps decide the tour; funnel 1 already matches them
+        scene_rule = ("Write 4-6 scenes that follow WHAT TO SHOW above, step by step and in its order: open each page it "
+                      "names (a route from the site map or the inventory; reach a deeper page by clicking its link, the "
+                      "inventory says on which page each link appears) and perform the actions it asks for with selectors "
+                      "from the list (type its example values where it gives them). Never replace a step with another "
+                      "page; a short hook first only if time allows. When the list has no element for a step, show the "
+                      "page where it happens and say what it does.")
+    else:
+        scene_rule += funnels_mod.scene_rule(funnels, personalized=audience is not None)
     bookend_rule = bookend_json = ""
     if ai_clips:
         bookend_rule = f"""
@@ -310,7 +319,7 @@ INTERACTIVE ELEMENTS ON THE LIVE APP (selectors are verified, use them verbatim;
 {_inventory_lines(app_info)}
 
 SITE MAP: PAGES VISITED WHILE PREPARING THIS BRIEF (each route is reachable; "shows" lists the page's headings)
-{site_map or "- (only the landing page was reachable)"}{funnels_mod.prompt_section(funnels)}{audience_block}
+{site_map or "- (only the landing page was reachable)"}{_instructions_block(instructions)}{funnels_mod.prompt_section(funnels)}{audience_block}
 
 RULES
 1. {scene_rule}
@@ -331,7 +340,7 @@ RULES
    Keep each scene's total dwell close to its narration time (about 400 ms per word): the scene ends when its
    narration ends, and later actions are skipped.
 5. The browser may be signed in to the user's real account: never sign out, delete, remove, cancel, purchase,
-   or change settings. Show, don't modify.
+   or change settings. Show, don't modify.{_instructions_exception(instructions)}
 6. Respond with JSON only:
 {{"project_name": "{name}", "tagline": "one punchy line",{bookend_json}{cover_json}{music_json} "plan_rationale": "...", "scenes": [{{"id": "scene-1",
   "title": "...", "route": "/", "why": "...", "narration": "...", "actions": [{{"type": "scroll", "value": "down", "dwell_ms": 1500}}]}}]}}
@@ -349,6 +358,20 @@ RULES
     else:
         reason = "GEMINI_API_KEY not set"
     return _template_storyboard(repo_info, app_info), f"{reason}: template storyboard fallback"
+
+
+def _instructions_block(instructions: Optional[str]) -> str:
+    """WHAT TO SHOW: the founder's own steps, quoted (starts with a blank line; '' without)."""
+    if not instructions:
+        return ""
+    text = instructions.replace("<<<", "<<").replace(">>>", ">>")
+    return f"\n\nWHAT TO SHOW (the founder's own steps for this demo; they decide the tour)\n<<<\n{text}\n>>>"
+
+
+def _instructions_exception(instructions: Optional[str]) -> str:
+    """Rule 5's one exception: the actions the founder asked for (never signing out, deleting or purchasing)."""
+    return ("\n   Exception: the steps WHAT TO SHOW asks for, which the founder chose; even then never sign out, delete "
+            "or purchase.") if instructions else ""
 
 
 def _sanitize_storyboard(data: Any, fallback_name: str) -> Storyboard:

@@ -191,6 +191,46 @@ async def planner_checks():
           and "1. PR to enforced standard: A pull request is checked against the org's rules. Pages: / -> /rules." in with_funnels
           and "Tour FUNNEL 1 above in order" in with_funnels, with_funnels[-900:])
     check("no funnels, no block and no rule (the prompt is unchanged)", no_funnels == plain and "FUNNEL" not in no_funnels)
+
+    print("planner: what to show (the founder's own steps)")
+    from app.main import _validation_sentence
+    from app.models.schemas import PipelineRequest
+    from pydantic import ValidationError
+    req = PipelineRequest(app_url="https://x.dev", instructions="  Open Rules\x07 and   enable it\n\n\n\nthen open Events  ")
+    check("instructions: control characters out, spaces collapsed, line breaks kept", req.instructions
+          == "Open Rules and enable it\n\nthen open Events", repr(req.instructions))
+    check("blank instructions are none", PipelineRequest(app_url="https://x.dev", instructions=" \n ").instructions is None)
+    try:
+        PipelineRequest(app_url="https://x.dev", instructions="x" * 1001)
+        check("instructions over 1000 characters are refused", False)
+    except ValidationError as exc:
+        message = _validation_sentence(exc.errors())
+        check("instructions over 1000 characters are refused with a sentence",
+              message == "instructions: string should have at most 1000 characters.", message)
+    steps = "Open Rules and enable 'Require a linked ticket'\nthen open Events and show the PR it blocked"
+    saved, os.environ["GEMINI_API_KEY"] = planner._generate_json, "offline-test-key"
+    planner._generate_json = capture
+    try:
+        await planner.generate_storyboard(repo, info, 60, "energetic_tech", "", funnels=funnels, instructions=steps)
+        guided = captured[-1]
+        await planner.generate_storyboard(repo, info, 60, "energetic_tech", "", instructions=None)
+        unguided = captured[-1]
+    finally:
+        planner._generate_json = saved
+        os.environ.pop("GEMINI_API_KEY", None)
+    check("WHAT TO SHOW sits after the site map and before the funnels, quoted",
+          guided.index("SITE MAP") < guided.index("WHAT TO SHOW (the founder's own steps") < guided.index("FUNNELS:")
+          < guided.index("RULES") and f"<<<\n{steps}\n>>>" in guided, guided[-1200:])
+    check("rule 1 becomes the founder's steps (no page tour, no funnel rule; the funnels block stays as context)",
+          "1. Write 4-6 scenes that follow WHAT TO SHOW above, step by step and in its order" in guided
+          and "Never replace a step with another page" in guided and "reach a deeper page by clicking its link" in guided
+          and "Tour FUNNEL 1" not in guided and "every scene starts on a different site-map page" not in guided
+          and "FUNNELS: THE PRODUCT'S STRONGEST PATHS" in guided, guided[guided.index("RULES"):][:900])
+    check("rule 5 allows exactly what it asks (never sign out, delete or purchase)",
+          "Exception: the steps WHAT TO SHOW asks for, which the founder chose; even then never sign out, delete or purchase."
+          in guided)
+    check("no instructions: no block, no rule, no exception (the prompt is unchanged)", unguided == plain
+          and "WHAT TO SHOW" not in unguided)
     sb = planner._sanitize_storyboard({"cover_visual": "  glowing   request paths ", "scenes": [
         {"title": "Hook", "route": "/", "narration": "Hello there."}]}, "X")
     check("cover_visual is cleaned up by the sanitizer", sb.cover_visual == "glowing request paths", sb.cover_visual)

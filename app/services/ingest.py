@@ -7,7 +7,7 @@ import re
 import time
 import tomllib
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 from urllib.parse import urlparse
 
 import httpx
@@ -27,6 +27,21 @@ MANIFESTS = ("package.json", "requirements.txt", "pyproject.toml")
 MAX_REPOS = 5
 BRIEF_MAX_PAGES = int(os.getenv("BRIEF_MAX_PAGES", "6"))  # pages explored beyond the landing page while preparing the brief
 BRIEF_BUDGET_SEC = 25   # ...within this much time
+FOCUS_EXTRA_PAGES = 2   # with the founder's steps, room to follow their links one level deeper
+_FOCUS_STOPWORDS = frozenset("the and then open show page pages click its with from into onto scroll finish start the "
+                             "for that this them there where what when your our you a an to of in on at by it is be".split())
+
+
+def focus_words(text: Optional[str]) -> Set[str]:
+    """The words of the founder's steps that can name a link ('Tutorial - User Guide' -> tutorial, user, guide)."""
+    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(w) >= 3 and w not in _FOCUS_STOPWORDS}
+
+
+def _focus_score(label: str, route: str, words: Set[str]) -> int:
+    """How many of the founder's words a link carries in its text or path."""
+    if not words:
+        return 0
+    return len(words & set(re.findall(r"[a-z0-9]+", f"{label} {route}".lower())))
 SHOT_TIMEOUT_MS = 8000  # a page screenshot for the vision brief never eats more of the budget than this
 MAX_INVENTORY_LINKS = 40
 
@@ -395,31 +410,46 @@ async def _screenshot(page, shots_dir: Optional[Path], index: int) -> Optional[s
 
 
 async def _explore_pages(page, landing_url: str, raw_links: List[Dict], shots_dir: Optional[Path] = None,
-                         on_page: Optional[Callable[[Dict], None]] = None) -> List[Dict[str, Any]]:
+                         on_page: Optional[Callable[[Dict], None]] = None,
+                         focus: Optional[str] = None) -> List[Dict[str, Any]]:
     """Visits the app's own pages (navigation links first, inside the demo's section) so the brief can say what
     each one shows. Bounded by BRIEF_MAX_PAGES and BRIEF_BUDGET_SEC.
 
     With `shots_dir`, each page is also screenshotted (page_01.jpg, ...) for the Gemini vision brief and the entry
-    gains `screenshot`; `on_page(entry)` is called after each page so the job log can report it live."""
+    gains `screenshot`; `on_page(entry)` is called after each page so the job log can report it live.
+
+    With `focus` (the founder's steps), links whose text or path carry its words are visited first, and the matching
+    links on those pages are followed one level deeper (FOCUS_EXTRA_PAGES more pages, same time budget), so a step
+    like "open the Tutorial, then First Steps" reaches a page the navigation alone would not."""
     origin = urlparse(landing_url).netloc
     landing_path = urlparse(landing_url).path.rstrip("/") or "/"
     section = _scope_section(landing_url)
-    candidates, seen = [], {landing_path}
-    for link in sorted(raw_links, key=lambda item: not item.get("nav")):
-        href, label = link["href"].strip(), link["text"].strip()
-        target = urlparse(link["abs"])
-        path = target.path.rstrip("/") or "/"
-        if (not href or not label or href.startswith(("#", "javascript:", "mailto:", "tel:"))
-                or target.scheme not in ("http", "https") or target.netloc != origin or path in seen
-                or is_risky(label=label, url=href) or (section and not path.startswith(section))
-                or _ACCOUNT_PATH.search(path)):
-            continue
-        seen.add(path)
-        candidates.append((link["abs"], path + ("?" + target.query if target.query else ""), href, label))
+    words = focus_words(focus)
+    seen = {landing_path}
+
+    def candidates_from(links: List[Dict]) -> List[tuple]:
+        found = []
+        for link in links:
+            href, label = link["href"].strip(), link["text"].strip()
+            target = urlparse(link["abs"])
+            path = target.path.rstrip("/") or "/"
+            if (not href or not label or href.startswith(("#", "javascript:", "mailto:", "tel:"))
+                    or target.scheme not in ("http", "https") or target.netloc != origin or path in seen
+                    or is_risky(label=label, url=href) or (section and not path.startswith(section))
+                    or _ACCOUNT_PATH.search(path)):
+                continue
+            seen.add(path)
+            route = path + ("?" + target.query if target.query else "")
+            found.append((link["abs"], route, href, label, _focus_score(label, route, words), bool(link.get("nav"))))
+        return found
+
+    queue = sorted(candidates_from(raw_links), key=lambda c: (-c[4], not c[5]))  # the founder's words, then navigation
+    limit = BRIEF_MAX_PAGES + (FOCUS_EXTRA_PAGES if words else 0)
     pages: List[Dict[str, Any]] = []
     started = time.monotonic()
-    for abs_url, route, href, label in candidates:
-        if len(pages) >= BRIEF_MAX_PAGES or time.monotonic() - started > BRIEF_BUDGET_SEC:
+    while queue:
+        abs_url, route, href, label, score, _nav = queue.pop(0)
+        if len(pages) >= limit or time.monotonic() - started > BRIEF_BUDGET_SEC:
             break
         try:
             await page.goto(abs_url, wait_until="domcontentloaded", timeout=15_000)
@@ -448,6 +478,9 @@ async def _explore_pages(page, landing_url: str, raw_links: List[Dict], shots_di
         shot = await _screenshot(page, shots_dir, len(pages))
         if shot:
             pages[-1]["screenshot"] = shot
+        if score:  # a page the founder asked for: its own matching links come next (one level deeper)
+            deeper = [c for c in candidates_from(info["links"]) if c[4]]
+            queue[:0] = sorted(deeper, key=lambda c: -c[4])
         if on_page is not None:
             try:
                 on_page(pages[-1])
@@ -458,7 +491,8 @@ async def _explore_pages(page, landing_url: str, raw_links: List[Dict], shots_di
 
 async def probe_app_url(app_url: str, storage_state: Optional[Dict] = None, replayer=None, *,
                         shots_dir: Optional[Path] = None,
-                        on_page: Optional[Callable[[Dict], None]] = None) -> Dict[str, Any]:
+                        on_page: Optional[Callable[[Dict], None]] = None,
+                        focus: Optional[str] = None) -> Dict[str, Any]:
     """Renders the app in headless Chromium (so SPAs work) and inventories what a demo could interact with.
 
     `storage_state` (a saved sign-in session) probes the app as the signed-in user. `login_form` reports a visible
@@ -500,7 +534,8 @@ async def probe_app_url(app_url: str, storage_state: Optional[Dict] = None, repl
             if shot:
                 result["screenshot"] = shot
             pages = [] if raw.get("hasPassword") else await _explore_pages(page, result["url"], raw["links"],
-                                                                            shots_dir=shots_dir, on_page=on_page)
+                                                                            shots_dir=shots_dir, on_page=on_page,
+                                                                            focus=focus)
         finally:
             await browser.close()
 

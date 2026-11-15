@@ -71,7 +71,7 @@ def _site_map(app_info: dict) -> List[str]:
     return lines
 
 
-def build_prompt(repo_info: dict, app_info: dict, project: str) -> str:
+def build_prompt(repo_info: dict, app_info: dict, project: str, instructions: Optional[str] = None) -> str:
     routes = repo_info.get("routes") or []
     flows = repo_info.get("flow_files") or []
     calls = [b.get("text") if isinstance(b, dict) else b for b in (app_info.get("buttons") or [])]
@@ -100,12 +100,21 @@ LIVE APP
 - Reachable pages (use ONLY these paths as steps):
 {chr(10).join(_site_map(app_info))}
 
-Return JSON only:
+{_focus(instructions)}Return JSON only:
 {{"funnels": [{{"name": "3-6 words", "outcome": "one sentence: what the user gets at the end",
   "steps": ["/", "/path", "..."], "evidence": "where this funnel shows in the code or the app (a file, a route, a button)",
   "strength": 0.0}}]}}
 Rules: at most {MAX_FUNNELS} funnels, strongest first; each has 2-{MAX_STEPS} steps in the order a user takes them, every step
 a path from the reachable pages above; strength is 0-1; never invent pages, features or metrics."""
+
+
+def _focus(instructions: Optional[str]) -> str:
+    """The founder's own steps, when given: the funnel that does them ranks first."""
+    if not instructions:
+        return ""
+    text = instructions.replace("<<<", "<<").replace(">>>", ">>")
+    return ("THE FOUNDER'S FOCUS (their own words: the funnel that does this is funnel 1, even if another looks stronger)\n"
+            f"<<<\n{text}\n>>>\n\n")
 
 
 def sanitize(data: Any, app_info: dict) -> List[Dict[str, Any]]:
@@ -140,9 +149,10 @@ def sanitize(data: Any, app_info: dict) -> List[Dict[str, Any]]:
 
 
 async def find_funnels(repo_info: dict, app_info: dict, project: str,
-                       log: Optional[Callable[[str], None]] = None) -> List[Dict[str, Any]]:
-    """Ranked funnels (possibly empty when none survives the reachability check). Raises on a Gemini failure."""
-    data = await gemini.generate_json(build_prompt(repo_info, app_info, project), thinking="low",
+                       log: Optional[Callable[[str], None]] = None, instructions: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Ranked funnels (possibly empty when none survives the reachability check); with `instructions`, the funnel
+    that matches them first. Raises on a Gemini failure."""
+    data = await gemini.generate_json(build_prompt(repo_info, app_info, project, instructions), thinking="low",
                                       timeout_sec=FUNNEL_TIMEOUT_SEC, purpose="find funnels")
     funnels = sanitize(data, app_info)
     if log is not None:

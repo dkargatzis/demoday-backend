@@ -284,6 +284,7 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
         repo_info, app_info = await asyncio.gather(
             extract_repos_context(req.repo_urls, github_token),
             probe_app_url(req.app_url, storage_state, replayer, shots_dir=shots_dir if feature_on("VISION") else None,
+                          focus=req.instructions,
                           on_page=lambda p: log(f"Explored {p['path']}: '{p['title']}' "
                                                 f"({len(p['headings'])} headings, {len(p['buttons'])} buttons)")),
         )
@@ -332,8 +333,8 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
         if feature_on("FUNNELS") and get_secret("GEMINI_API_KEY"):
             evidence = len(repo_info.get("routes") or []) + len(repo_info.get("flow_files") or [])
             step("funnels", "running", detail=f"{evidence} routes and flow files in the code, {len(pages) + 1} live pages")
-            funnel_task = asyncio.create_task(funnels_mod.find_funnels(repo_info, app_info,
-                                                                       project_name(repo_info, app_info), log))
+            funnel_task = asyncio.create_task(funnels_mod.find_funnels(repo_info, app_info, project_name(repo_info, app_info),
+                                                                       log, instructions=req.instructions))
             _TASKS.add(funnel_task)
             funnel_task.add_done_callback(_TASKS.discard)
             background.append(funnel_task)
@@ -358,7 +359,9 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
 
         # 2. Plan the storyboard; write the launch kit in the background meanwhile
         job.stage = "planning"
-        step("storyboard", "running")
+        step("storyboard", "running", detail="following your instructions" if req.instructions else None)
+        if req.instructions:
+            log("Your instructions for the tour: \"" + " / ".join(req.instructions.splitlines())[:240] + "\"")
         log("Planning the storyboard...")
         want_music = feature_on("MUSIC") and bool(get_secret("FAL_KEY"))
         # Cover: the poster and the title cards' backdrop, the product's own screen in a browser frame (a FLUX still
@@ -373,7 +376,7 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
         storyboard, note = await generate_storyboard(
             repo_info, app_info, req.target_seconds, req.voice_style, ", ".join(req.repo_urls),
             ai_clips=req.ai_clips, audience=brief, title_cards=title_cards, want_music=want_music,
-            want_cover=cover_off is None and not product_shots, funnels=funnels,
+            want_cover=cover_off is None and not product_shots, funnels=funnels, instructions=req.instructions,
         )
         log(note)
         job.storyboard = storyboard
@@ -767,6 +770,8 @@ def create_pipeline_job(req: PipelineRequest, user_id: Optional[str] = None) -> 
     options: Dict[str, Any] = {"goals": req.goals, "requestedLanguage": req.language}
     if req.language != "auto":
         options["language"] = req.language
+    if req.instructions:
+        options["instructions"] = req.instructions
     job = JobStatus(job_id=job_id, status="queued", progress=0, stage="queued", logs=["Job queued"],
                     app_url=req.app_url, created_at=time.time(), options=options,
                     audience=audience.pending_brief(req.audience) if req.audience else None)

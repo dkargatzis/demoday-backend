@@ -225,7 +225,8 @@ async def main():
 
     print("request and job contracts")
     integrated = "audience" in PipelineRequest.model_fields
-    expected = {**FROZEN_REQUEST, **({"audience": None} if integrated else {})}
+    expected = {**FROZEN_REQUEST, **({"audience": None} if integrated else {}),
+                **({"instructions": None} if "instructions" in PipelineRequest.model_fields else {})}  # additive, None by default
     check(f"PipelineRequest without audience dumps today's dict{'' if integrated else ' (pre-integration)'}",
           PipelineRequest(app_url="https://x.dev").model_dump() == expected, PipelineRequest(app_url="https://x.dev").model_dump())
     kit = LaunchKit(readme_markdown="r", devpost_pitch="d", x_thread=["t"], linkedin_post="l")
