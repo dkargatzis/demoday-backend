@@ -123,6 +123,15 @@ def _scope_rule(app_info: dict) -> str:
             f"and never visit marketing pages (home, pricing, how-it-works, sign-in).")
 
 
+# What the vision brief (vision.py) saw on a page that makes it not worth a scene: quality -> wording for the planner.
+FLAGGED_PAGES = {"login": "a sign-in form", "error": "an error page", "empty": "almost no content"}
+
+
+def _flagged(page: dict) -> bool:
+    """True when Gemini's look at the page's screenshot found a sign-in wall, an error page or almost no content."""
+    return (page.get("insight") or {}).get("quality") in FLAGGED_PAGES
+
+
 def _site_map_lines(app_info: dict) -> str:
     lines = []
     for page in app_info.get("pages", []):
@@ -133,9 +142,27 @@ def _site_map_lines(app_info: dict) -> str:
             bits.append("buttons: " + ", ".join(page["buttons"]))
         if page.get("inputs"):
             bits.append("inputs: " + ", ".join(page["inputs"]))
+        insight = page.get("insight") or {}  # written by vision.describe_pages when Gemini saw the screenshot
+        if insight.get("purpose"):
+            bits.append(f'Gemini saw: "{insight["purpose"]}"')
+            if insight.get("demo_moment"):
+                bits.append(f'best moment: "{insight["demo_moment"]}"')
+        if insight.get("quality") in FLAGGED_PAGES:
+            bits.append(f"AVOID: in the brief this page showed {FLAGGED_PAGES[insight['quality']]}, so do not film it")
         bits.append(f'open with: click {page["open_selector"]}')
         lines.append("; ".join(bits))
     return "\n".join(lines)
+
+
+def _landing_insight_line(app_info: dict) -> str:
+    """One PROJECT line (with its newline) when Gemini looked at the landing page's screenshot, else empty."""
+    insight = app_info.get("landing_insight") or {}
+    if not insight.get("purpose"):
+        return ""
+    line = f"- What the landing page shows (Gemini looked at a screenshot): {insight['purpose']}"
+    if insight.get("demo_moment"):
+        line += f"; best moment: {insight['demo_moment']}"
+    return line + "\n"
 
 
 def _inventory_lines(app_info: dict) -> str:
@@ -164,7 +191,7 @@ async def generate_storyboard(
     name = project_name(repo_info, app_info)
     narrated_sec = target_seconds - TAIL_ALLOWANCE_SEC - (BOOKEND_ALLOWANCE_SEC if ai_clips else 0)
     total_words = max(30, int(narrated_sec * WORDS_PER_SECOND.get(voice_style, 2.4)))
-    pages = app_info.get("pages") or []
+    pages = [page for page in app_info.get("pages") or [] if not _flagged(page)]  # flagged ones stay on the site map
     site_map = _site_map_lines(app_info)
     if pages:
         scene_rule = (f"Write {'5-6' if len(pages) >= 4 else '4-5'} scenes as a tour of the product: a hook on the landing page, "
@@ -195,7 +222,7 @@ PROJECT
 - Language: {repo_info.get('language', '')}; dependencies: {', '.join(repo_info.get('dependencies', [])[:20])}
 - Live app: {app_info.get('url', '')} - title "{app_info.get('title', '')}"; description: "{app_info.get('description', '')}"
 - Headings on the landing page: {' | '.join(app_info.get('headings', [])[:8])}
-- Page routes found in the repository: {', '.join(repo_info.get('routes', [])) or 'none detected'}
+{_landing_insight_line(app_info)}- Page routes found in the repository: {', '.join(repo_info.get('routes', [])) or 'none detected'}
 
 README EXCERPT
 <<<
@@ -229,8 +256,11 @@ RULES
 5. The browser may be signed in to the user's real account: never sign out, delete, remove, cancel, purchase,
    or change settings. Show, don't modify.
 6. Respond with JSON only:
-{{"project_name": "{name}", "tagline": "one punchy line",{bookend_json} "scenes": [{{"id": "scene-1", "title": "...",
-  "route": "/", "narration": "...", "actions": [{{"type": "scroll", "value": "down", "dwell_ms": 1500}}]}}]}}{bookend_rule}
+{{"project_name": "{name}", "tagline": "one punchy line",{bookend_json} "plan_rationale": "...", "scenes": [{{"id": "scene-1",
+  "title": "...", "route": "/", "why": "...", "narration": "...", "actions": [{{"type": "scroll", "value": "down", "dwell_ms": 1500}}]}}]}}
+   "plan_rationale": one sentence, spoken to the founder, on why these pages in this order (for example: Opening on
+   the benchmark page because the README leads with performance). Each scene's "why": <= 20 words on what this
+   scene proves about the product.{bookend_rule}
 """
     if get_secret("GEMINI_API_KEY"):
         try:
@@ -266,6 +296,7 @@ def _sanitize_storyboard(data: Any, fallback_name: str) -> Storyboard:
             route=route,
             narration=narration[:600],
             actions=actions[:8],
+            why=_clean_narration(raw.get("why"))[:160] or None,
         ))
     if not scenes:
         raise ValueError("storyboard contained no usable scenes")
@@ -275,6 +306,7 @@ def _sanitize_storyboard(data: Any, fallback_name: str) -> Storyboard:
         scenes=scenes[:6],
         intro_visual=_clean_narration(data.get("intro_visual"))[:400] or None,
         outro_visual=_clean_narration(data.get("outro_visual"))[:400] or None,
+        plan_rationale=_clean_narration(data.get("plan_rationale"))[:200] or None,
     )
 
 

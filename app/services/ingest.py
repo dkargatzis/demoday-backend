@@ -1,10 +1,13 @@
 """Context gathering: GitHub repositories (public or private) and a rendered inventory of the live app."""
 import asyncio
 import json
+import logging
+import os
 import re
 import time
 import tomllib
-from typing import Any, Dict, Iterable, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -16,12 +19,15 @@ from app.services.netguard import guard_context
 from app.services.recorder import (VIEWPORT, declutter_page, is_risky, launch_chromium, session_storage_script,
                                    split_session_storage, wait_for_loaders)
 
+logger = logging.getLogger("demoday.ingest")
+
 GITHUB_API = GITHUB_API_URL
 RAW_GITHUB = GITHUB_RAW_URL
 MANIFESTS = ("package.json", "requirements.txt", "pyproject.toml")
 MAX_REPOS = 5
-BRIEF_MAX_PAGES = 6     # pages explored beyond the landing page while preparing the brief
+BRIEF_MAX_PAGES = int(os.getenv("BRIEF_MAX_PAGES", "6"))  # pages explored beyond the landing page while preparing the brief
 BRIEF_BUDGET_SEC = 25   # ...within this much time
+SHOT_TIMEOUT_MS = 8000  # a page screenshot for the vision brief never eats more of the budget than this
 MAX_INVENTORY_LINKS = 40
 
 
@@ -353,9 +359,28 @@ def _link_entries(raw_links: List[Dict], origin: str, seen_paths: set, on: Optio
     return entries
 
 
-async def _explore_pages(page, landing_url: str, raw_links: List[Dict]) -> List[Dict[str, Any]]:
+async def _screenshot(page, shots_dir: Optional[Path], index: int) -> Optional[str]:
+    """Viewport JPEG of the page as the recording will show it (page_00 is the landing page), for the Gemini vision
+    brief. Returns the file path, or None when no `shots_dir` was given or the capture failed."""
+    if shots_dir is None:
+        return None
+    path = Path(shots_dir) / f"page_{index:02d}.jpg"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        await page.screenshot(path=str(path), type="jpeg", quality=50, timeout=SHOT_TIMEOUT_MS)
+    except (PlaywrightError, OSError) as exc:
+        logger.warning("screenshot %s failed: %s", path.name, (str(exc).strip() or type(exc).__name__).splitlines()[0][:120])
+        return None
+    return str(path)
+
+
+async def _explore_pages(page, landing_url: str, raw_links: List[Dict], shots_dir: Optional[Path] = None,
+                         on_page: Optional[Callable[[Dict], None]] = None) -> List[Dict[str, Any]]:
     """Visits the app's own pages (navigation links first, inside the demo's section) so the brief can say what
-    each one shows. Bounded by BRIEF_MAX_PAGES and BRIEF_BUDGET_SEC."""
+    each one shows. Bounded by BRIEF_MAX_PAGES and BRIEF_BUDGET_SEC.
+
+    With `shots_dir`, each page is also screenshotted (page_01.jpg, ...) for the Gemini vision brief and the entry
+    gains `screenshot`; `on_page(entry)` is called after each page so the job log can report it live."""
     origin = urlparse(landing_url).netloc
     landing_path = urlparse(landing_url).path.rstrip("/") or "/"
     section = _scope_section(landing_url)
@@ -400,14 +425,26 @@ async def _explore_pages(page, landing_url: str, raw_links: List[Dict]) -> List[
                        if (i["placeholder"] or i["aria"] or i["name"])][:4],
             "raw_links": info["links"],
         })
+        shot = await _screenshot(page, shots_dir, len(pages))
+        if shot:
+            pages[-1]["screenshot"] = shot
+        if on_page is not None:
+            try:
+                on_page(pages[-1])
+            except Exception as exc:  # a log callback never stops the exploration
+                logger.warning("on_page callback failed: %s", exc)
     return pages
 
 
-async def probe_app_url(app_url: str, storage_state: Optional[Dict] = None, replayer=None) -> Dict[str, Any]:
+async def probe_app_url(app_url: str, storage_state: Optional[Dict] = None, replayer=None, *,
+                        shots_dir: Optional[Path] = None,
+                        on_page: Optional[Callable[[Dict], None]] = None) -> Dict[str, Any]:
     """Renders the app in headless Chromium (so SPAs work) and inventories what a demo could interact with.
 
     `storage_state` (a saved sign-in session) probes the app as the signed-in user. `login_form` reports a visible
     password field, which usually means a sign-in wall. Returns an `error` key when the page can't be loaded at all.
+    With `shots_dir`, the landing page is saved as page_00.jpg (`screenshot`) and every explored page as
+    page_NN.jpg (`pages[i]['screenshot']`) for the Gemini vision brief; `on_page` is called per explored page.
     """
     result: Dict[str, Any] = {"url": app_url, "status": 0, "title": "", "description": "", "headings": [],
                               "links": [], "buttons": [], "inputs": [], "login_form": False, "pages": []}
@@ -439,7 +476,11 @@ async def probe_app_url(app_url: str, storage_state: Optional[Dict] = None, repl
             await declutter_page(page)  # inventory the page as the recording will show it
             result["url"] = page.url
             raw = await page.evaluate(INVENTORY_SCRIPT)
-            pages = [] if raw.get("hasPassword") else await _explore_pages(page, result["url"], raw["links"])
+            shot = await _screenshot(page, shots_dir, 0)
+            if shot:
+                result["screenshot"] = shot
+            pages = [] if raw.get("hasPassword") else await _explore_pages(page, result["url"], raw["links"],
+                                                                            shots_dir=shots_dir, on_page=on_page)
         finally:
             await browser.close()
 
