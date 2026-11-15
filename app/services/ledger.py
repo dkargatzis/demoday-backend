@@ -4,6 +4,7 @@ The orchestrator binds the running job to the task context; any code on that tas
 wraps a call in `ledger.call(...)` adds a row to `job.tool_calls`. Rows are never written once the job is terminal,
 so the `done` event, the last status snapshot and `GET /api/jobs/{id}` stay identical. Without `bind` it is a no-op.
 """
+import asyncio
 import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -38,6 +39,9 @@ async def call(tool: str, purpose: str, model: str) -> AsyncIterator[Optional[To
             row = None
     try:
         yield row
+    except asyncio.CancelledError:
+        _finish(job, row, ok=False, note="cancelled")
+        raise
     except BaseException as exc:
         _finish(job, row, ok=False, note=_short(exc))
         raise
@@ -72,7 +76,7 @@ def summary(job: JobStatus) -> str:
         bucket = totals.setdefault(row.tool, {"calls": 0, "ms": 0})
         bucket["calls"] += 1
         bucket["ms"] += row.ms or 0
-        if row.ok is False:
+        if row.ok is False and row.purpose != "warm-up":
             fallbacks += 1
     parts = [f"{TOOL_NAMES.get(tool, tool)} {int(b['calls'])} call{'' if b['calls'] == 1 else 's'} ({b['ms'] / 1000:.1f} s)"
              for tool, b in totals.items()]

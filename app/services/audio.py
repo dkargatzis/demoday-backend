@@ -9,6 +9,7 @@ import base64
 import logging
 import shutil
 import tempfile
+import time
 import wave
 from pathlib import Path
 from typing import Optional, Tuple
@@ -27,6 +28,7 @@ FAL_TTS_ENDPOINT = "fal-ai/kokoro/american-english"
 # How long to wait for fal.ai per clip before falling back (Google Cloud TTS / local). fal's Kokoro queue can take
 # 1-2 minutes to spin a worker up when it has gone cold; warm_up_fal() starts that early in the job.
 FAL_TTS_TIMEOUT_SEC = int(os.getenv("FAL_TTS_TIMEOUT_SEC", "90"))
+FAL_TTS_GRACE_SEC = int(os.getenv("FAL_TTS_GRACE_SEC", "20"))  # once Google TTS is ready, how much longer fal may take
 
 # voice_style -> (Kokoro voice, Kokoro speed, local TTS words-per-minute)
 VOICE_PRESETS = {
@@ -47,25 +49,7 @@ async def synthesize_scene_audio(text: str, output_path, voice_style: str = "ene
 
     with tempfile.TemporaryDirectory(dir=output_path.parent) as tmp:
         tmp_dir = Path(tmp)
-        raw: Optional[Path] = None
-        engine = ""
-        fal_key = get_secret("FAL_KEY")
-        if fal_key:
-            try:
-                raw = await _fal_tts(text, tmp_dir, voice, speed, fal_key)
-                engine = f"fal.ai Kokoro ({voice}, {speed}x)"
-            except Exception as exc:
-                logger.warning("fal.ai TTS failed: %s", exc)
-                reason = (f"no answer within {FAL_TTS_TIMEOUT_SEC}s, its queue is slow" if "timed out" in str(exc)
-                          else _short(exc))
-                engine = f"fal.ai {reason} → "
-        if raw is None and cloud.google_tts_enabled():  # Google Cloud Chirp 3 HD (no key: runtime credentials)
-            try:
-                raw = await cloud.google_tts(text, tmp_dir / "google.wav", voice_style)
-                engine += f"Google Cloud TTS ({cloud.GOOGLE_VOICES.get(voice_style, cloud.GOOGLE_VOICES['energetic_tech'])[0]})"
-            except Exception as exc:
-                logger.warning("Google TTS failed: %s", exc)
-                engine += f"Google TTS unavailable ({_short(exc)}) → "
+        raw, engine = await _race_tts(text, tmp_dir, voice, speed, voice_style)
         if raw is None:
             raw = await _local_tts(text, tmp_dir, wpm)
             if raw is not None:
@@ -96,6 +80,51 @@ async def warm_up_fal() -> None:
                                    client_timeout=300)
     except Exception as exc:
         logger.info("fal.ai warm-up did not complete: %s", _short(exc))
+
+
+async def _race_tts(text: str, tmp_dir: Path, voice: str, speed: float, voice_style: str) -> Tuple[Optional[Path], str]:
+    """fal.ai Kokoro and Google Cloud TTS (Chirp 3 HD, runtime credentials) run side by side.
+
+    fal wins whenever it answers first, or within FAL_TTS_GRACE_SEC of Google; a slow fal queue therefore costs
+    seconds, not the full FAL_TTS_TIMEOUT_SEC. Returns (audio path or None, a description of what happened).
+    """
+    fal_key = get_secret("FAL_KEY")
+    fal_task = asyncio.create_task(_fal_tts(text, tmp_dir, voice, speed, fal_key)) if fal_key else None
+    google_task = (asyncio.create_task(cloud.google_tts(text, tmp_dir / "google.wav", voice_style))
+                   if cloud.google_tts_enabled() else None)
+    google_name = cloud.GOOGLE_VOICES.get(voice_style, cloud.GOOGLE_VOICES["energetic_tech"])[0]
+    started = time.monotonic()
+    note = ""
+    if fal_task is not None:
+        deadline = started + FAL_TTS_TIMEOUT_SEC
+        while not fal_task.done() and time.monotonic() < deadline:
+            pending = {task for task in (fal_task, google_task) if task is not None and not task.done()}
+            await asyncio.wait(pending, timeout=deadline - time.monotonic(), return_when=asyncio.FIRST_COMPLETED)
+            if google_task is not None and google_task.done() and not fal_task.done() and google_task.exception() is None:
+                grace = max(0.0, min(FAL_TTS_GRACE_SEC, deadline - time.monotonic()))
+                try:
+                    await asyncio.wait_for(asyncio.shield(fal_task), grace)
+                except (asyncio.TimeoutError, Exception):
+                    pass
+                break
+        if fal_task.done() and not fal_task.cancelled() and fal_task.exception() is None:
+            if google_task is not None:
+                google_task.cancel()
+            return fal_task.result(), f"fal.ai Kokoro ({voice}, {speed}x)"
+        if fal_task.done() and not fal_task.cancelled():
+            exc = fal_task.exception()
+            logger.warning("fal.ai TTS failed: %s", exc)
+            note = f"fal.ai {_short(exc)} → "
+        else:
+            fal_task.cancel()
+            note = f"fal.ai no answer within {time.monotonic() - started:.0f}s, its queue is slow → "
+    if google_task is not None:
+        try:
+            return await google_task, note + f"Google Cloud TTS ({google_name})"
+        except Exception as exc:
+            logger.warning("Google TTS failed: %s", exc)
+            note += f"Google TTS unavailable ({_short(exc)}) → "
+    return None, note
 
 
 async def _fal_tts(text: str, tmp_dir: Path, voice: str, speed: float, key: str) -> Path:
