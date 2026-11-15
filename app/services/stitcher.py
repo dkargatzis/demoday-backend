@@ -10,6 +10,7 @@ PathLike = Union[str, Path]
 FPS = 30
 WIDTH, HEIGHT = 1920, 1080
 AUDIO_RATE = 48000
+DISSOLVE_SEC = 0.3  # a scene whose page opened off camera fades in from the previous scene's last frame
 
 
 class MediaToolError(RuntimeError):
@@ -124,34 +125,69 @@ def zoom_filter(focus: Sequence[Tuple[float, float, float, float, float]], durat
     return f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':d=1:s={WIDTH}x{HEIGHT}:fps={FPS}"
 
 
+def freeze_frames(holds: Sequence[Tuple[float, float]], duration_sec: float) -> List[Tuple[int, int, int]]:
+    """(first, last, replacement) frame numbers for each hold: every frame of a page load shows the frame before it.
+
+    Holds are (begin, end) seconds into the clip; overlapping or touching holds merge, and nothing reaches past the
+    clip's last frame.
+    """
+    total = max(1, round(duration_sec * FPS))
+    out: List[Tuple[int, int, int]] = []
+    for begin, end in sorted(holds):
+        first, last = max(1, round(begin * FPS)), min(total - 1, round(end * FPS) - 1)
+        if last < first:
+            continue
+        if out and first <= out[-1][1] + 1:  # merge into the previous freeze, which keeps its replacement frame
+            out[-1] = (out[-1][0], max(out[-1][1], last), out[-1][2])
+        else:
+            out.append((first, last, first - 1))
+    return out
+
+
 async def mux_scene_clip(
     video_path: PathLike, audio_path: PathLike, output_path: PathLike,
     start_sec: float, duration_sec: float,
     focus: Sequence[Tuple[float, float, float, float, float]] = (),
+    holds: Sequence[Tuple[float, float]] = (),
+    dissolve_from: Optional[PathLike] = None,
 ) -> None:
     """Cuts [start, start+duration] out of the session recording and muxes it with the scene narration.
 
     Both streams are forced to exactly `duration_sec`: video holds its last frame if the recording runs
     short, and narration is padded with silence. Every clip shares identical codec parameters
     (H.264 high/yuv420p 1080p30, AAC 48 kHz stereo), so clips can be concatenated losslessly.
-    `focus` adds smooth zooms toward clicked or typed-into elements (see `zoom_filter`).
+    `focus` adds smooth zooms toward clicked or typed-into elements (see `zoom_filter`). `holds` freezes page loads
+    on the frame they started from (see `freeze_frames`), before the zoom, so a zoom still moves over them.
+    `dissolve_from` (an image: the previous clip's last frame) fades into the clip over DISSOLVE_SEC without
+    changing its length.
     """
     d = f"{duration_sec:.4f}"
     zoom = zoom_filter(focus, duration_sec)
-    video_chain = (
+    chains = [
         f"[0:v]setpts=PTS-STARTPTS,fps={FPS},"
         f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,"
         f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
-        f"tpad=stop_mode=clone:stop_duration={d},trim=duration={d},setpts=PTS-STARTPTS,"
-        + (f"{zoom}," if zoom else "") + "format=yuv420p[v]"
-    )
+        f"tpad=stop_mode=clone:stop_duration={d},trim=duration={d},setpts=PTS-STARTPTS[f0]"
+    ]
+    freezes = freeze_frames(holds, duration_sec)
+    for i, (first, last, replace) in enumerate(freezes):
+        chains.append(f"[f{i}]split=2[f{i}m][f{i}r];"
+                      f"[f{i}m][f{i}r]freezeframes=first={first}:last={last}:replace={replace}[f{i + 1}]")
+    out = "v" if dissolve_from is None else "live"
+    chains.append(f"[f{len(freezes)}]" + (f"{zoom}," if zoom else "") + f"format=yuv420p[{out}]")
+    inputs = ["-ss", f"{max(0.0, start_sec):.4f}", "-i", str(video_path), "-i", str(audio_path)]
+    if dissolve_from is not None:
+        inputs += ["-loop", "1", "-framerate", str(FPS), "-t", f"{DISSOLVE_SEC:.3f}", "-i", str(dissolve_from)]
+        chains.append(f"[2:v]scale={WIDTH}:{HEIGHT},setsar=1,format=rgba,"
+                      f"fade=out:st=0:d={DISSOLVE_SEC:.3f}:alpha=1[previous];"
+                      f"[live][previous]overlay=eof_action=pass,format=yuv420p[v]")
+    video_chain = ";".join(chains)
     audio_chain = (
         f"[1:a]aresample={AUDIO_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo,"
         f"apad,atrim=duration={d},asetpts=PTS-STARTPTS[a]"
     )
     await run_ffmpeg([
-        "-ss", f"{max(0.0, start_sec):.4f}", "-i", str(video_path),
-        "-i", str(audio_path),
+        *inputs,
         "-filter_complex", f"{video_chain};{audio_chain}",
         "-map", "[v]", "-map", "[a]",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-profile:v", "high",
@@ -205,6 +241,15 @@ async def make_bookend(
         "-t", d, "-movflags", "+faststart",
         str(output_path),
     ])
+
+
+async def last_frame(clip_path: PathLike, image_path: PathLike) -> Path:
+    """Writes the clip's final video frame to `image_path` (PNG): what a dissolve into the next clip starts from."""
+    image_path = Path(image_path)
+    await run_ffmpeg(["-sseof", "-0.5", "-i", str(clip_path), "-map", "0:v:0", "-update", "1", str(image_path)])
+    if not image_path.is_file() or image_path.stat().st_size == 0:
+        raise MediaToolError(f"no frame could be read from the end of {Path(clip_path).name}")
+    return image_path
 
 
 async def concat_scenes(clip_paths: List[PathLike], final_output_path: PathLike) -> None:

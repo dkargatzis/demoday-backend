@@ -5,6 +5,11 @@ over between scenes like a human-driven demo: text typed in scene 2 is still the
 scene's footage window opens only after its page has loaded and settled, so blank frames and loading
 spinners between scenes never reach the final video; the muxer cuts each window out of the session.
 
+Scenes join without a visible cut where they can: a scene whose first step clicks a link that is on screen at the
+end of the previous scene starts on that page and clicks through on camera. Page loads on camera are "held": the
+muxer freezes the frame the click was made on until the next page has painted, so loading screens never show. A
+scene that has to open its page off camera is marked `opening="cut"`, and the muxer dissolves into it.
+
 Frames are kept clean (consent banners accepted or hidden, chat widgets hidden, skeleton loaders waited
 out), clicks get a highlight ring, and every click or typed field is logged as a focus event with its
 timestamp so the muxer can zoom toward it.
@@ -37,6 +42,15 @@ LOADER_WAIT_SEC = 4.0
 CLICK_ZOOM, TYPE_ZOOM = 1.45, 1.55
 CLICK_HOLD_SEC = 1.6
 MIN_HOLD_SEC = 0.35  # a click that navigates still gets ring, push-in, page change, pull-back
+MAX_LOAD_HOLD_SEC = 3.0  # the longest a page load on camera stays behind the frame it was started from
+MIN_LOAD_HOLD_SEC = 0.1  # shorter loads are not worth a freeze
+CUT_GUARD_SEC = 0.3  # before a page opens off camera: under load the recording can run ahead of the clock, and the
+# previous scene's last frames must not catch the next page loading
+QUIET_DOM_SEC = 1.5  # after a page change, how long to wait for its content to stop changing (data still loading)
+
+# A cheap signature of what the page shows; unchanged across polls means the page has finished filling in.
+DOM_SIGNATURE_SCRIPT = "() => [document.body ? document.body.innerText.length : 0, document.images.length, " \
+                       "document.querySelectorAll('tr, li, [role=row]').length].join(':')"
 
 LogFn = Callable[[str], None]
 FocusTuple = Tuple[float, float, float, float, float]  # (t, cx, cy, zoom, hold)
@@ -169,7 +183,7 @@ DECLUTTER_SCRIPT = r"""
 # Number of visible loading indicators still on the page (skeletons, spinners, progress bars).
 LOADERS_SCRIPT = r"""
 () => {
-  const sel = '[class*="skeleton" i], [class*="spinner" i], [class*="shimmer" i], [class*="loading" i], [class*="placeholder-glow" i], .animate-pulse, [role="progressbar"], [aria-busy="true"]';
+  const sel = '[class*="skeleton" i], [class*="spinner" i], [class*="shimmer" i], [class*="loading" i], [class*="placeholder-glow" i], .animate-pulse, .animate-spin, [role="progressbar"], [aria-busy="true"]';
   let n = 0;
   for (const el of document.querySelectorAll(sel)) {
     if (el.closest("[data-demoday]")) continue;
@@ -257,6 +271,10 @@ class SceneSegment:
     start: float     # seconds into the session recording where the scene's footage begins
     duration: float  # seconds of footage for the scene (narration + tail)
     focus: List[FocusTuple] = field(default_factory=list)  # zoom targets, times relative to the scene start
+    holds: List[Tuple[float, float]] = field(default_factory=list)  # page loads to freeze, relative to the scene
+    # How the scene began: "first", "continues" (on the page the previous scene ended on), "clicks" (there, and its
+    # first click opens its page on camera) or "cut" (its page was opened off camera: the muxer dissolves into it).
+    opening: str = "continues"
 
 
 def resolve_url(app_url: str, route: Optional[str]) -> Optional[str]:
@@ -405,7 +423,8 @@ async def record_session(
                 for idx, (scene, duration) in enumerate(zip(scenes, durations)):
                     if on_scene:
                         on_scene(idx)
-                    await director.open_scene(idx + 1, scene.route, first=(idx == 0))
+                    opening = await director.open_scene(idx + 1, scene.route, first=(idx == 0),
+                                                        lead=scene.actions[0] if scene.actions else None)
                     start = time.monotonic()
                     await director.run(idx + 1, scene.actions, deadline=start + duration)
                     remaining = start + duration - time.monotonic()
@@ -413,8 +432,13 @@ async def record_session(
                         await asyncio.sleep(remaining)
                     scene_start = start - session_start
                     segments.append(SceneSegment(start=scene_start, duration=duration,
-                                                 focus=director.focus_for(scene_start, duration)))
+                                                 focus=director.focus_for(scene_start, duration),
+                                                 holds=director.holds_for(scene_start, duration), opening=opening))
 
+                if director.holds:
+                    longest = max(end - begin for begin, end in director.holds)
+                    log(f"Page loads on camera: {len(director.holds)} held on the frame they started from "
+                        f"(longest {longest:.1f}s), so no loading screen shows")
                 cleaned = director.cleaned
                 if cleaned["accepted"] or cleaned["hidden"]:
                     log(f"Cleaned frames: {cleaned['accepted']} consent banner(s) accepted, "
@@ -445,8 +469,30 @@ class _Director:
         self.landed: Dict[str, str] = {}  # requested URL -> URL after redirects
         self.focus: List[FocusTuple] = []  # (session time, cx, cy, zoom, hold)
         self.releases: List[float] = []    # session times when the view changed (navigation, scroll)
+        self.holds: List[Tuple[float, float]] = []  # session times of page loads on camera, to freeze
+        self.navigations = 0  # main-frame navigations so far, including same-document (history API) ones
         self.cleaned = {"accepted": 0, "hidden": 0}
-        page.on("framenavigated", lambda frame: frame == page.main_frame and self.releases.append(self.clock()))
+        page.on("framenavigated", self._on_navigated)
+
+    def _on_navigated(self, frame) -> None:
+        if frame == self.page.main_frame:
+            self.navigations += 1
+            self.releases.append(self.clock())
+
+    def holds_for(self, scene_start: float, duration: float) -> List[Tuple[float, float]]:
+        """Page loads inside a scene, re-based to the scene and clipped to it."""
+        out = []
+        for begin, end in self.holds:
+            begin, end = max(begin, scene_start), min(end, scene_start + duration)
+            if end - begin >= MIN_LOAD_HOLD_SEC:
+                out.append((round(begin - scene_start, 3), round(end - scene_start, 3)))
+        return out
+
+    def _hold(self, begin: float) -> None:
+        """Records a page load on camera, from `begin` (the frame to freeze on) until now."""
+        end = min(self.clock(), begin + MAX_LOAD_HOLD_SEC)
+        if end - begin >= MIN_LOAD_HOLD_SEC:
+            self.holds.append((begin, end))
 
     def focus_for(self, scene_start: float, duration: float) -> List[FocusTuple]:
         """Focus events inside a scene, re-based to the scene and cut short by the next view change."""
@@ -464,15 +510,40 @@ class _Director:
                 out.append((t - scene_start, cx, cy, zoom, end - t))
         return out
 
-    async def open_scene(self, scene_no: int, route: str, first: bool) -> None:
+    async def open_scene(self, scene_no: int, route: str, first: bool, lead: Optional[Action] = None) -> str:
+        """Gets the page ready before the scene's footage starts; returns how the scene opens (SceneSegment.opening).
+
+        When the scene's page is not the one on screen but its first step clicks a visible link to it, the page is
+        left as it is: that click opens the scene's page on camera, so the cut between the scenes is invisible.
+        """
         target = resolve_url(self.app_url, route)
         if target is None:
             self.log(f"Scene {scene_no}: ignoring unsupported route {route!r}")
             target = self.app_url
+        opening = "first" if first else "continues"
         if first or not _same_page(self.page.url, self.landed.get(target, target)):
+            if not first and await self._link_on_screen(lead, target):
+                self.log(f"Scene {scene_no}: starts where scene {scene_no - 1} ended and clicks through to "
+                         f"{urlparse(target).path or '/'} on camera")
+                return "clicks"
+            if not first:
+                await asyncio.sleep(CUT_GUARD_SEC)
             await self._goto(target, scene_no)
             self.landed[target] = self.page.url
+            opening = "first" if first else "cut"
         await self._settle()
+        return opening
+
+    async def _link_on_screen(self, lead: Optional[Action], target: str) -> bool:
+        """True when `lead` is a click on a link to `target` that the current page shows."""
+        href = _link_href(lead.selector) if lead is not None and lead.type == "click" else None
+        url = resolve_url(self.app_url, href) if href else None
+        if not url or is_risky(url=url) or not _same_page(url, target):
+            return False
+        try:
+            return await self.page.locator(lead.selector).filter(visible=True).count() > 0
+        except PlaywrightError:
+            return False
 
     async def run(self, scene_no: int, actions: Sequence[Action], deadline: float) -> None:
         for position, action in enumerate(actions):
@@ -503,11 +574,16 @@ class _Director:
             if is_risky(url=url):
                 self.log(f"Scene {scene_no}: skipped opening {url} (sign-out and destructive pages are never opened)")
                 return False
-            await self._goto(url, scene_no)
-            await self._settle(budget_ms=min(4000, self._budget_ms(deadline)))
+            await self._navigate(url, scene_no, deadline)
             return True
         if action.type == "scroll":
             return await self._scroll(scene_no, action)
+        if action.type == "click":
+            href = _link_href(action.selector)
+            url = resolve_url(self.app_url, href) if href else None
+            if url and _same_page(self.page.url, url):  # a link to the page on screen: nothing would change
+                self.log(f"Scene {scene_no}: already on {href}, so that click is skipped (its pause is kept)")
+                return True
 
         target = await self._find(action.selector)
         if target is None:
@@ -519,8 +595,7 @@ class _Director:
                 return False
             if url:
                 self.log(f"Scene {scene_no}: link {href!r} not on screen, navigating to it directly")
-                await self._goto(url, scene_no)
-                await self._settle(budget_ms=min(4000, self._budget_ms(deadline)))
+                await self._navigate(url, scene_no, deadline)
                 return True
             self.log(f"Scene {scene_no}: selector {action.selector!r} not found, {action.type} skipped")
             return False
@@ -532,13 +607,23 @@ class _Director:
                 return False
         centre = await self._point_at(target)
         if not await target.evaluate(HIT_TEST_SCRIPT):
+            href = _link_href(action.selector) if action.type == "click" else None
+            url = resolve_url(self.app_url, href) if href else None
+            if url and not is_risky(url=url):  # the scene still needs that page (it may have opened on camera)
+                self.log(f"Scene {scene_no}: link {href!r} is covered, navigating to it directly")
+                await self._navigate(url, scene_no, deadline)
+                return True
             self.log(f"Scene {scene_no}: {action.selector!r} is hidden or covered, {action.type} skipped")
             return False
         if action.type == "click":
             if centre:
                 self.focus.append((self.clock(), centre[0], centre[1], CLICK_ZOOM, CLICK_HOLD_SEC))
+            navigations, pressed = self.navigations, self.clock()
             await target.click(timeout=min(ACTION_TIMEOUT_MS, self._budget_ms(deadline)))
             await self._after_interaction(deadline)
+            if self.navigations > navigations:  # the click opened a page: freeze on the click until it painted
+                await self._quiet_dom(deadline)
+                self._hold(pressed)
             return True
         # type
         text = action.value or ""
@@ -551,9 +636,35 @@ class _Director:
         await target.fill("", timeout=ACTION_TIMEOUT_MS)
         await target.press_sequentially(text, delay=delay)
         if submit:
+            navigations, pressed = self.navigations, self.clock()
             await target.press("Enter")
             await self._after_interaction(deadline)
+            if self.navigations > navigations:
+                await self._quiet_dom(deadline)
+                self._hold(pressed)
         return True
+
+    async def _quiet_dom(self, deadline: float) -> None:
+        """Waits (up to QUIET_DOM_SEC) until the page's content stops changing across two polls."""
+        stop = min(time.monotonic() + QUIET_DOM_SEC, deadline - 0.5)
+        last, steady = None, 0
+        while time.monotonic() < stop:
+            try:
+                signature = await self.page.evaluate(DOM_SIGNATURE_SCRIPT)
+            except PlaywrightError:  # mid-navigation: the old document is gone
+                signature = None
+            steady = steady + 1 if signature is not None and signature == last else 0
+            if steady >= 2:
+                return
+            last = signature
+            await asyncio.sleep(0.15)
+
+    async def _navigate(self, url: str, scene_no: int, deadline: float) -> None:
+        """Opens `url` on camera; the load is held on the frame before it."""
+        started = self.clock()
+        await self._goto(url, scene_no)
+        await self._settle(budget_ms=min(4000, self._budget_ms(deadline)))
+        self._hold(started)
 
     async def _goto(self, url: str, scene_no: int) -> None:
         try:

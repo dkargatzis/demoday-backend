@@ -352,7 +352,8 @@ async def retake_scene(scene: Scene, idx: int, app_url: str, clip_duration: floa
                                         storage_state=storage_state, replayer=replayer)
         segment = segments[0]
         clip = job_dir / f"scene_{number:02d}_take2.mp4"
-        await mux_scene_clip(session, audio_path, clip, segment.start, segment.duration, focus=segment.focus)
+        await mux_scene_clip(session, audio_path, clip, segment.start, segment.duration, focus=segment.focus,
+                             holds=segment.holds)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - a retake never takes the job down

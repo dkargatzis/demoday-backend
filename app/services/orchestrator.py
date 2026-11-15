@@ -6,7 +6,7 @@ import shutil
 import time
 import uuid
 from pathlib import Path
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
 
 from app import db, vault
@@ -26,7 +26,8 @@ from app.services.ingest import extract_repos_context, probe_app_url
 from app.services.netguard import BlockedURL, ensure_public_url
 from app.services.planner import generate_launch_kit, generate_storyboard, project_name
 from app.services.recorder import fit_dwells, record_session
-from app.services.stitcher import concat_scenes, describe_media, frame_aligned, make_bookend, mux_scene_clip
+from app.services.stitcher import (MediaToolError, concat_scenes, describe_media, frame_aligned, last_frame,
+                                   make_bookend, mux_scene_clip)
 
 logger = logging.getLogger("demoday.pipeline")
 
@@ -225,6 +226,27 @@ def _script_storyboard(script: Dict[str, Any], lines: Optional[List[str]]) -> St
         if lines and i < len(lines) and lines[i]:
             scene.narration = lines[i]
     return storyboard
+
+
+def transitions_line(segments: Sequence[Any], dissolves: int) -> str:
+    """How the scenes joined: '3 scenes click through on camera, 1 continues on the same page, 1 dissolve'."""
+    after_first = [segment.opening for segment in segments[1:]]
+    parts = []
+    clicks = after_first.count("clicks")
+    if clicks:
+        parts.append(f"{clicks} scene{'s' if clicks != 1 else ''} click{'' if clicks != 1 else 's'} through on camera")
+    same = after_first.count("continues")
+    if same:
+        parts.append(f"{same} continue{'' if same != 1 else 's'} on the same page")
+    if dissolves:
+        parts.append(f"{dissolves} dissolve{'s' if dissolves != 1 else ''}")
+    cuts = after_first.count("cut") - dissolves
+    if cuts > 0:
+        parts.append(f"{cuts} hard cut{'s' if cuts != 1 else ''}")
+    held = sum(len(getattr(segment, "holds", []) or []) for segment in segments)
+    if held:
+        parts.append(f"{held} page load{'s' if held != 1 else ''} held off screen")
+    return ", ".join(parts)
 
 
 async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional[str] = None,
@@ -594,18 +616,30 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
             job.progress = 65
 
             clips = []
+            dissolves = 0
             for i, segment in enumerate(segments):
                 log(f"Scene {i + 1}/{len(scenes)}: muxing H.264/AAC clip ({segment.duration:.2f}s)")
                 clip = job_dir / f"scene_{i + 1:02d}.mp4"
+                previous = None
+                if segment.opening == "cut" and clips:  # its page opened off camera: fade in from the last frame
+                    try:
+                        previous = await last_frame(clips[-1], job_dir / f"scene_{i:02d}_last.png")
+                    except MediaToolError as exc:
+                        log(f"Scene {i + 1}/{len(scenes)}: hard cut ({exc})")
                 await mux_scene_clip(session_path, audio_paths[i], clip, segment.start, segment.duration,
-                                     focus=segment.focus)
+                                     focus=segment.focus, holds=segment.holds, dissolve_from=previous)
+                dissolves += previous is not None
                 if segment.focus:
                     log(f"Scene {i + 1}/{len(scenes)}: {len(segment.focus)} focus zoom(s) toward clicked elements")
                 clips.append(clip)
                 # Clip length (narration + tail), so cumulative durations are exact scene offsets in demo.mp4.
                 scenes[i].duration_sec = round(segment.duration, 3)
                 job.progress = 65 + int(17 * (i + 1) / len(segments))
-            step("record", "done", detail=f"{len(clips)} clips, {sum(len(s.focus or []) for s in segments)} focus zooms")
+            joins = transitions_line(segments, dissolves)
+            if joins:
+                log(f"Transitions: {joins}")
+            step("record", "done", detail=f"{len(clips)} clips, {sum(len(s.focus or []) for s in segments)} focus zooms"
+                 + (f" · {joins}" if joins else ""))
 
         # 4b. Review the footage in the background (Gemini on contact sheets of the muxed clips); it overlaps the
         # bookend wait and encodes, and is collected before the cut while clips[i] still pairs with scenes[i].

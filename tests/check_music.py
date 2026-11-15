@@ -64,6 +64,23 @@ def residual_db(mixed, original):
     return float(match.group(1)) if match else None
 
 
+def bed_swing_db(mixed, original, total):
+    """How far the ducked bed moves: (mixed - original) RMS per 100 ms, p90 - p10 in dB, fades left out.
+
+    On a steady bed this is the ducking alone. The old duck (ratio 6, 40/500 ms) swung it ~13 dB, so the music
+    vanished under every line and swelled back in every pause.
+    """
+    out = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(mixed), "-i", str(original), "-filter_complex",
+                          "[0:a][1:a]amerge=inputs=2,pan=mono|c0=c0-c2,"
+                          f"atrim=start=2:end={total - 3:.2f},asetnsamples=4800,astats=metadata=1:reset=1,"
+                          "ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-", "-f", "null", "-"],
+                         capture_output=True, text=True).stdout
+    levels = sorted(float(v) for v in re.findall(r"RMS_level=(-?[\d.]+)", out))
+    if len(levels) < 20:
+        return None
+    return levels[int(0.9 * (len(levels) - 1))] - levels[int(0.1 * (len(levels) - 1))]
+
+
 class Log:
     def __init__(self):
         self.lines = []
@@ -115,7 +132,7 @@ async def with_fake_fal(module, coro):
             sys.modules.pop("fal_client", None)
 
 
-async def test_mix(bed, label):
+async def test_mix(bed, label, steady=False):
     print(f"mix_under with the {label}")
     source = await describe_media(DEMO)
     out = WORK / f"demo_{label.replace(' ', '_')}.mp4"
@@ -142,6 +159,10 @@ async def test_mix(bed, label):
     check("the music is really in there (mix minus original is not silence)", added is not None and added > -50,
           f"residual mean {added} dB")
     check("logs the mixed line", log.has("Soundtrack mixed under the narration ("), log.find("Soundtrack mixed"))
+    if steady:
+        swing = bed_swing_db(out, DEMO, source["duration"])
+        check("a steady bed stays steady under the voice (the duck moves it under 6 dB, no pumping)",
+              swing is not None and swing < 6.0, f"{swing:.1f} dB" if swing is not None else "unmeasured")
     return after
 
 
@@ -278,7 +299,7 @@ async def test_finish():
     t0 = time.monotonic()
     note = await music.finish(task, raw, final, log, grace=5, on_skip=skips.append)
     check("ready track: mixed into demo.mp4 and the note returned",
-          note == "stable-audio-3/small · 30 s track · mixed at -14 dB, ducked under the voice" and final.is_file()
+          note == "stable-audio-3/small · 30 s track · mixed at -18 dB, ducked under the voice" and final.is_file()
           and raw.is_file() and not skips, f"{note!r} in {time.monotonic() - t0:.1f}s")
     mixed = await describe_media(final)
     check("the mixed demo.mp4 is valid", mixed["video_codec"] == "h264" and mixed["audio_codec"] == "aac"
@@ -326,17 +347,17 @@ def test_helpers():
     print("helpers")
     check("bed_seconds_for: target + 10, capped at 120, floor 5",
           [music.bed_seconds_for(t) for t in (30, 60, 110, 115, 120, 1)] == [40, 70, 120, 120, 120, 11])
-    check("level_db default", music.level_db() == -14.0)
+    check("level_db default", music.level_db() == -18.0)
     os.environ["MUSIC_LEVEL_DB"] = "-20"
     check("MUSIC_LEVEL_DB knob", music.level_db() == -20.0)
     os.environ["MUSIC_LEVEL_DB"] = "loud"
-    check("garbage MUSIC_LEVEL_DB falls back", music.level_db() == -14.0)
+    check("garbage MUSIC_LEVEL_DB falls back", music.level_db() == -18.0)
     os.environ["MUSIC_LEVEL_DB"] = "5"
     check("MUSIC_LEVEL_DB is clamped to <= 0 dB", music.level_db() == 0.0)
     os.environ["MUSIC_LEVEL_DB"] = ""
     check("model_label", music.model_label("fal-ai/stable-audio-3/small/music/base/text-to-audio") == "stable-audio-3/small"
           and music.model_label("fal-ai/ace-step-1.5") == "ace-step-1.5")
-    check("describe note", music.describe(40.2) == "stable-audio-3/small · 40 s track · mixed at -14 dB, ducked under the voice",
+    check("describe note", music.describe(40.2) == "stable-audio-3/small · 40 s track · mixed at -18 dB, ducked under the voice",
           music.describe(40.2))
     check("skip and late lines", music.skip_line("x") == "Soundtrack skipped: x; the video has narration only"
           and music.late_reason(12) == "fal.ai did not deliver within 12s of the final cut")
@@ -405,7 +426,7 @@ def make_samples():
 
 async def main():
     make_samples()
-    levels = [await test_mix(BED_MP3, "mp3 bed"), await test_mix(BED_FLAC, "flac bed in a .bin")]
+    levels = [await test_mix(BED_MP3, "mp3 bed", steady=True), await test_mix(BED_FLAC, "flac bed in a .bin")]
     if BED_LIVE.is_file():
         levels.append(await test_mix(BED_LIVE, "louder live 40 s bed"))
     print("bed level is deterministic across generations")

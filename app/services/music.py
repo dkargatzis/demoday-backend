@@ -8,7 +8,7 @@ the one call the orchestrator makes at concat time: a short grace wait for a lat
 fallback. Nothing here may take the job down: every failure costs one log line and an amber step row.
 
 Log lines: "Soundtrack: Gemini's brief '...' → fal.ai {model} ({n}s requested)", "Soundtrack ready: 40.0s of music in
-12.3s", "Soundtrack mixed under the narration (40s bed at -14 dB, ducked while the voice speaks)" or
+12.3s", "Soundtrack mixed under the narration (40s bed at -18 dB, ducked while the voice speaks)" or
 "Soundtrack skipped: {reason}; the video has narration only".
 """
 import asyncio
@@ -37,10 +37,10 @@ MAX_TRACK_SEC = 120            # the endpoint's ceiling
 EXTRA_BED_SEC = 10             # requested on top of the target runtime so the loop seam rarely plays
 MAX_MUSIC_BYTES = 30 * 1024 * 1024
 # Generations differ by 10+ LU (probe bed -11.9 LUFS, a later one +1.0), so the bed is measured and normalized to the
-# probe bed's level before the gain; MUSIC_LEVEL_DB (default -14) is then exactly the validated graph's volume filter,
-# about 10 LU under the -16 LUFS narration before ducking.
+# probe bed's level before the gain; MUSIC_LEVEL_DB (default -18) is then exactly the validated graph's volume filter,
+# about 14 LU under the -16 LUFS narration before ducking.
 BED_REF_LUFS = -12.0
-DEFAULT_LEVEL_DB = -14.0
+DEFAULT_LEVEL_DB = -18.0
 PROMPT_SUFFIX = "Instrumental, no vocals, no lyrics, steady energy, background bed for a product demo."
 NEGATIVE_PROMPT = "vocals, singing, lyrics, speech, voice"
 TEMPLATE_MUSIC = {
@@ -48,8 +48,10 @@ TEMPLATE_MUSIC = {
     "calm_expert": "calm ambient piano and warm pads, 84 bpm, instrumental, no vocals",
     "fast_founder": "driving indie electronic, 126 bpm, bass and bright synths, instrumental, no vocals",
 }
-# Measured on a -16.5 LUFS narration: the mix lands at -16.7 LUFS with the bed 14 dB under the voice and this ducking.
-DUCK = "threshold=0.02:ratio=6:attack=40:release=500:makeup=1"
+# A gentle duck, so the bed stays steady: measured with real narration (five scenes, 63 s) over a steady bed, it moves
+# 3.9 dB between speech and pauses and sits 18 LU under the voice. The old one (ratio 6, 40/500 ms, level -14) moved
+# it 13.4 dB, 50 times a minute: the music vanished under every sentence and swelled back in every pause.
+DUCK = "threshold=0.05:ratio=2:attack=250:release=1800:knee=6:detection=rms:makeup=1"
 FADE_IN_SEC, FADE_OUT_SEC = 1.0, 2.5
 MIX_TIMEOUT_SEC = 180
 
@@ -61,7 +63,7 @@ Log = Callable[[str], None]
 
 
 def level_db() -> float:
-    """The gain on the normalized bed before ducking (env MUSIC_LEVEL_DB, default -14; clamped to [-40, 0])."""
+    """The gain on the normalized bed before ducking (env MUSIC_LEVEL_DB, default -18; clamped to [-40, 0])."""
     try:
         return max(-40.0, min(0.0, float(os.getenv("MUSIC_LEVEL_DB", "") or DEFAULT_LEVEL_DB)))
     except ValueError:
@@ -101,7 +103,7 @@ def late_reason(grace: float = GRACE_SEC) -> str:
 
 
 def describe(track_seconds: float, *, model: Optional[str] = None, level: Optional[float] = None) -> str:
-    """The Storyboard.soundtrack note: 'stable-audio-3/small · 40 s track · mixed at -14 dB, ducked under the voice'."""
+    """The Storyboard.soundtrack note: 'stable-audio-3/small · 40 s track · mixed at -18 dB, ducked under the voice'."""
     level = level_db() if level is None else level
     return f"{model_label(model)} · {track_seconds:.0f} s track · mixed at {level:.0f} dB, ducked under the voice"
 
