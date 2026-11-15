@@ -185,13 +185,13 @@ def _inventory_lines(app_info: dict) -> str:
 async def generate_storyboard(
     repo_info: dict, app_info: dict, target_seconds: int = 60, voice_style: str = "energetic_tech",
     repo_url: str = "", ai_clips: bool = False, audience: Optional[AudienceBrief] = None,
-    title_cards: bool = False, want_music: bool = False,
+    title_cards: bool = False, want_music: bool = False, want_cover: bool = False,
 ) -> Tuple[Storyboard, str]:
     """Returns (storyboard, human-readable note on which planner produced it).
 
     With `ai_clips` or `title_cards`, the intro/outro take part of the runtime; Gemini also describes the AI shots
     (`ai_clips`) or the art behind the typeset cards (`title_cards`, "cover_visual"). `want_music` asks for a
-    "music_prompt" for the soundtrack.
+    "music_prompt" for the soundtrack, `want_cover` for a "cover_visual" for the poster (it takes no runtime).
     """
     name = project_name(repo_info, app_info)
     bookends_on = ai_clips or title_cards
@@ -233,6 +233,13 @@ async def generate_storyboard(
    "music_prompt": one sentence describing instrumental background music for this demo for a music model: genre,
    mood, tempo and two or three instruments that fit the product and the tone; no vocals, no artist or song names."""
         music_json = ' "music_prompt": "...",'
+    cover_rule = cover_json = ""
+    if want_cover and not title_cards:  # with title cards, rule 7 asks for it: one image serves cards and poster
+        cover_rule = """
+   "cover_visual": one or two sentences of art direction for one still image an image model will paint as the
+   video's cover, behind its typeset title. Evoke the product's domain with abstract shapes, light, materials and
+   colour. It must contain no text, letters, numbers, logos, screens, user interfaces or people."""
+        cover_json = ' "cover_visual": "...",'
     audience_block = audience_mod.prompt_section(audience)  # "" for None: the generic prompt stays byte-identical
     audience_rule = audience_mod.storyboard_rule(audience)
     prompt = f"""You are directing a {target_seconds}-second product demo video for a hackathon submission.
@@ -278,11 +285,11 @@ RULES
 5. The browser may be signed in to the user's real account: never sign out, delete, remove, cancel, purchase,
    or change settings. Show, don't modify.
 6. Respond with JSON only:
-{{"project_name": "{name}", "tagline": "one punchy line",{bookend_json}{music_json} "plan_rationale": "...", "scenes": [{{"id": "scene-1",
+{{"project_name": "{name}", "tagline": "one punchy line",{bookend_json}{cover_json}{music_json} "plan_rationale": "...", "scenes": [{{"id": "scene-1",
   "title": "...", "route": "/", "why": "...", "narration": "...", "actions": [{{"type": "scroll", "value": "down", "dwell_ms": 1500}}]}}]}}
    "plan_rationale": one sentence, spoken to the founder, on why these pages in this order (for example: Opening on
    the benchmark page because the README leads with performance). Each scene's "why": <= 20 words on what this
-   scene proves about the product.{music_rule}{bookend_rule}{audience_rule}
+   scene proves about the product.{music_rule}{cover_rule}{bookend_rule}{audience_rule}
 """
     if get_secret("GEMINI_API_KEY"):
         try:

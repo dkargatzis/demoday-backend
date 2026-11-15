@@ -33,7 +33,9 @@ logger = logging.getLogger("demoday")
 
 JOB_ID_RE = re.compile(r"^[a-f0-9]{8,32}$")
 SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
-ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
+# The dashboard (3000) and Launch Kit (3780) in local development; deploy.sh sets the hosted origin.
+ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000,"
+                                        "http://localhost:3780,http://127.0.0.1:3780").split(",")
            if o.strip()]
 
 
@@ -81,6 +83,13 @@ the run for one customer: their public site is read for at most 15 s, a source-t
 the intro/outro cards name them, and the launch kit gains `outreach_email` and `linkedin_dm` carrying the literal
 `{{DEMO_LINK}}` placeholder. The job carries `audience` from the 202 on (source `pending` until research finishes).
 
+**Cover poster.** With fal.ai configured, every run paints one FLUX still from Gemini's art direction
+(`storyboard.cover_visual`) under a title the browser typesets: a 1280x720 JPEG kept next to the video and served
+at `GET /api/pipeline/cover/{job_id}` (`job.cover_url`, `coverUrl` in `GET /api/jobs`), for `<video poster>`. A
+personalized run's poster is its "Made for" intro card, the video's first frame. Generic runs get no intro or outro
+cards. `storyboard.cover` says how the poster was made or why it was skipped (no FAL_KEY, `FEATURE_COVER=0`, FLUX
+failed or took too long); the video never depends on it.
+
 **Errors.** `4xx` responses carry `detail` (a sentence). Validation errors (422) carry `message` (one plain sentence)
 plus Pydantic's per-field `detail`.
 
@@ -103,7 +112,7 @@ OPENAPI_TAGS = [
 app = FastAPI(
     title="DemoDay Launch Kit Engine",
     description=API_DESCRIPTION,
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
     openapi_tags=OPENAPI_TAGS,
 )
@@ -201,7 +210,8 @@ async def list_jobs(user: Dict = Depends(auth.current_user), limit: int = Query(
                                     customer=job.audience.company if job.audience else None,
                                     persona=job.audience.persona if job.audience else None,
                                     customerGoal=job.audience.goal if job.audience else None,
-                                    durationSec=job.storyboard.total_duration_sec if job.storyboard else None))
+                                    durationSec=job.storyboard.total_duration_sec if job.storyboard else None,
+                                    coverUrl=job.cover_url))
         if len(summaries) >= limit:
             break
     return summaries
@@ -252,6 +262,21 @@ async def get_video(job_id: str, download: bool = False, user: Dict = Depends(au
         filename=f"demo-{job_id}.mp4",
         content_disposition_type="attachment" if download else "inline",
     )
+
+
+@app.get("/api/pipeline/cover/{job_id}", tags=["pipeline"], summary="The video's cover poster (1280x720 JPEG)",
+         response_class=FileResponse,
+         responses={200: {"description": "image/jpeg: a fal.ai FLUX still under the typeset title, for `<video poster>`",
+                          "content": {"image/jpeg": {"schema": {"type": "string", "format": "binary"}}}},
+                    401: {"model": ErrorDetail},
+                    404: {"model": ErrorDetail,
+                          "description": "Not your job, not finished yet, or no poster (`storyboard.cover` says why)"}})
+async def get_cover(job_id: str, user: Dict = Depends(auth.current_user)):
+    _job_for(job_id, user)
+    cover_path = storage_root() / job_id / "cover.jpg"
+    if not cover_path.is_file():
+        raise HTTPException(status_code=404, detail="Cover not found")
+    return FileResponse(cover_path, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
 
 
 # --------------------------------------------------------------------------- settings: GitHub token

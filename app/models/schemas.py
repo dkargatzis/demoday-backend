@@ -161,6 +161,8 @@ class JobStatus(BaseModel):
     storyboard: Optional[Storyboard] = None
     launch_kit: Optional[LaunchKit] = None
     video_url: Optional[str] = None
+    cover_url: Optional[str] = Field(default=None, description="The cover poster (1280x720 JPEG, for <video poster>), "
+                                                               "when one was painted")
     error: Optional[str] = None
     app_url: Optional[str] = None
     created_at: Optional[float] = Field(default=None, description="Unix time the job was accepted")
@@ -188,6 +190,7 @@ class JobSummary(BaseModel):
     persona: Optional[str] = None
     customerGoal: Optional[str] = None
     durationSec: Optional[float] = None
+    coverUrl: Optional[str] = Field(default=None, description="The cover poster, when one was painted")
 
 
 class ErrorMessage(BaseModel):

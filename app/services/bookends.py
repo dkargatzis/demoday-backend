@@ -6,6 +6,9 @@ Each bookend is a typeset title card (real text rendered by the browser, never d
 plus one narrated line in the same voice as the demo. Without fal.ai, or when it fails, the card sits on a slowly
 zooming gradient, so the demo never depends on it. The cards are rendered FIRST, before any fal.ai wait, so Chromium
 never runs during the timed browser recording that overlaps this work.
+
+The cover poster (cover.jpg, 1280x720) is the painted intro card in cards mode; a run without title cards gets the
+same kind of FLUX still under a typeset title from `prepare_poster`, with the same rules.
 """
 import asyncio
 import base64
@@ -40,6 +43,7 @@ MAX_VIDEO_BYTES = 150 * 1024 * 1024
 FAL_IMAGE_MODEL = os.getenv("FAL_IMAGE_MODEL", "fal-ai/flux/schnell")
 FAL_IMAGE_TIMEOUT_SEC = 90
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
+POSTER_WIDTH, POSTER_HEIGHT = 1280, 720  # cover.jpg, the video's poster
 NO_TEXT = ("No text, letters, numbers, logos, watermarks, screens, user interfaces, people, faces or hands anywhere "
            "in the frame.")
 NEGATIVE = "text, letters, words, numbers, logo, watermark, user interface, screen, people, face, hands, blur, distortion"
@@ -64,6 +68,15 @@ class Bookend:
     video: Optional[Path] = None   # the AI clip, when generation succeeded
     note: str = ""
     thumb: Optional[str] = None    # base64 320 px JPEG of the finished intro card, for the one-off step event only
+    painted: bool = False          # the FLUX still is the background (cards mode)
+    poster: Optional[Path] = None  # cover.jpg: the painted intro card at POSTER_WIDTH (cards mode)
+
+
+@dataclass
+class Poster:
+    path: Path                     # cover.jpg, POSTER_WIDTH x POSTER_HEIGHT
+    note: str
+    thumb: Optional[str] = None    # base64 320 px JPEG, for the one-off step event only
 
 
 def _video_arguments(prompt: str) -> Dict:
@@ -216,15 +229,31 @@ async def _render_cards(cards: Dict[str, str], job_dir: Path) -> Dict[str, Dict[
     return paths
 
 
+async def _compose_card(background: Path, overlay: Path, dest: Path, width: int, quality: int = 6) -> Path:
+    """The finished card (background + typeset overlay) as a `width`-pixel JPEG."""
+    await run_ffmpeg(["-i", str(background), "-i", str(overlay), "-filter_complex",
+                      f"[0:v]scale={WIDTH}:{HEIGHT}[bg];[bg][1:v]overlay=0:0,scale={width}:-2,format=yuv420p[v]",
+                      "-map", "[v]", "-q:v", str(quality), "-frames:v", "1", "-update", "1", str(dest)], timeout=60)
+    return dest
+
+
 async def _card_thumb(background: Path, overlay: Path, dest: Path, width: int = 320) -> Optional[str]:
-    """The finished card (background + typeset overlay) as a `width`-pixel base64 JPEG for the agent trace."""
+    """The finished card as a `width`-pixel base64 JPEG for the agent trace."""
     try:
-        await run_ffmpeg(["-i", str(background), "-i", str(overlay), "-filter_complex",
-                          f"[0:v]scale={WIDTH}:{HEIGHT}[bg];[bg][1:v]overlay=0:0,scale={width}:-2,format=yuv420p[v]",
-                          "-map", "[v]", "-q:v", "6", "-frames:v", "1", "-update", "1", str(dest)], timeout=60)
+        await _compose_card(background, overlay, dest, width)
         return base64.b64encode(dest.read_bytes()).decode("ascii")
     except Exception as exc:  # a missing thumbnail only costs the trace its picture
         logger.warning("card thumbnail failed: %s", exc)
+        return None
+
+
+async def _poster(background: Path, overlay: Path, dest: Path) -> Optional[Path]:
+    """cover.jpg: the finished card at POSTER_WIDTH, or None (a missing poster never costs the demo)."""
+    try:
+        return await _compose_card(background, overlay, dest, POSTER_WIDTH, quality=3)
+    except Exception as exc:
+        logger.warning("cover poster failed: %s", exc)
+        dest.unlink(missing_ok=True)
         return None
 
 
@@ -240,13 +269,14 @@ def _reason(exc: BaseException) -> str:
 async def prepare_bookends(job_dir: Path, project: str, tagline: str, app_url: str, repo_urls, voice_style: str,
                            visuals: Dict[str, Optional[str]], log, mode: str = "video",
                            overrides: Optional[Dict[str, Dict[str, str]]] = None,
-                           video: bool = True) -> Dict[str, Bookend]:
+                           video: bool = True, paint: bool = True) -> Dict[str, Bookend]:
     """Title cards, narration and the fal.ai media for the intro and outro.
 
     `mode="video"`: one fal.ai text-to-video clip per card when FAL_KEY is set and `video` is True (today's AI clips);
     `video=False` never calls the video endpoint (a personalized run without ai_clips: typeset cards, no credits).
     `mode="cards"`: one fal.ai FLUX still from `visuals["cover"]` (Gemini's art direction; `intro` or the template
-    when absent) is the background of both cards; the video endpoint is never called.
+    when absent) is the background of both cards; the video endpoint is never called. The painted intro card also
+    becomes the poster (`Bookend.poster`, cover.jpg); `paint=False` (FEATURE_COVER=0) keeps both cards on the gradient.
     `overrides` replaces a card's text and spoken line per kind: {"intro": {"kicker", "title", "subtitle", "small",
     "line"}}, e.g. "Made for Acme". The cards are rendered before any fal.ai wait (see the module docstring).
     """
@@ -282,7 +312,7 @@ async def prepare_bookends(job_dir: Path, project: str, tagline: str, app_url: s
                                       timeout=FAL_VIDEO_TIMEOUT_SEC + 30)
 
     async def cover() -> Optional[Path]:
-        if not key:
+        if not key or not paint:
             return None
         visual = " ".join((visuals.get("cover") or visuals.get("intro") or TEMPLATE_VISUALS["cover"]).split())
         log(f"Cover art: fal.ai {'FLUX' if 'flux' in FAL_IMAGE_MODEL else 'image model'} ({FAL_IMAGE_MODEL}) painting "
@@ -313,7 +343,7 @@ async def prepare_bookends(job_dir: Path, project: str, tagline: str, app_url: s
                     background = media
                     note = f"fal.ai {'FLUX' if 'flux' in FAL_IMAGE_MODEL else 'image'} background ({FAL_IMAGE_MODEL})"
                 else:
-                    note = "typeset title on a gradient (FAL_KEY not set)"
+                    note = f"typeset title on a gradient ({'FAL_KEY not set' if not key else 'FEATURE_COVER is off'})"
             elif media:
                 note = f"AI clip from {FAL_VIDEO_MODEL}"
             else:
@@ -328,9 +358,42 @@ async def prepare_bookends(job_dir: Path, project: str, tagline: str, app_url: s
                 note = f"typeset title card (AI clip unavailable: {_reason(exc)})"
         bookends[kind] = Bookend(kind=kind, narration=job_dir / f"{kind}.wav", narration_sec=duration,
                                  overlay=card_paths[kind]["overlay"], background=background,
-                                 video=media if mode != "cards" else None, note=note)
+                                 video=media if mode != "cards" else None, note=note,
+                                 painted=bool(mode == "cards" and media))
         log(f"{kind.capitalize()}: {note}")
     if mode == "cards":
         intro = bookends["intro"]
         intro.thumb = await _card_thumb(intro.background, intro.overlay, job_dir / "cover_card.jpg")
+        if intro.painted:  # the poster is the video's first frame: the painted intro card
+            intro.poster = await _poster(intro.background, intro.overlay, job_dir / "cover.jpg")
     return bookends
+
+
+async def prepare_poster(job_dir: Path, project: str, tagline: str, visual: Optional[str], log,
+                         card: Optional[Dict[str, str]] = None) -> Poster:
+    """The cover poster of a run without title cards: one fal.ai FLUX still under a title the browser typesets.
+
+    `card` (a personalized run's intro override: kicker, title, subtitle, small) replaces the default "Product demo"
+    title. The rules of the cards hold: the overlay is rendered first (Chromium is done before the timed recording),
+    and the image model never sees the product name. Raises when FAL_KEY is missing or FLUX fails; the caller
+    records the reason and skips the step.
+    """
+    key = get_secret("FAL_KEY")
+    if not key:
+        raise RuntimeError("FAL_KEY not set")
+    if card:
+        content = _title_content(card.get("kicker") or "", card.get("title") or project, card.get("subtitle") or "",
+                                 card.get("small") or "")
+    else:
+        content = _title_content("Product demo", project, tagline.strip().rstrip(".")[:110])
+    overlay = (await _render_cards({"poster": content}, job_dir))["poster"]["overlay"]
+    visual = " ".join((visual or TEMPLATE_VISUALS["cover"]).split())
+    painter = "FLUX" if "flux" in FAL_IMAGE_MODEL else "image model"
+    log(f"Cover art: fal.ai {painter} ({FAL_IMAGE_MODEL}) painting '{visual[:100].rstrip('. ')}' for the poster")
+    background = await asyncio.wait_for(_generate_image(cover_prompt(visual, project), job_dir / "cover.png", key, log),
+                                        timeout=FAL_IMAGE_TIMEOUT_SEC + 30)
+    path = await _compose_card(background, overlay, job_dir / "cover.jpg", POSTER_WIDTH, quality=3)
+    thumb = await _card_thumb(background, overlay, job_dir / "cover_card.jpg")
+    note = f"fal.ai {'FLUX' if 'flux' in FAL_IMAGE_MODEL else 'image'} poster ({FAL_IMAGE_MODEL})"
+    log(f"Cover poster ready: {POSTER_WIDTH}x{POSTER_HEIGHT}, {path.stat().st_size / 1e3:.0f} kB")
+    return Poster(path=path, note=note, thumb=thumb)

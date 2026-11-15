@@ -14,7 +14,8 @@ from app.services import ledger, music, plancheck, review, vision
 from app.models.schemas import JobStatus, PipelineRequest, StepState
 from app.services import audience
 from app.services.audio import synthesize_scene_audio, warm_up_fal
-from app.services.bookends import FAL_IMAGE_MODEL, FAL_VIDEO_MODEL, prepare_bookends
+from app.services.bookends import (FAL_IMAGE_MODEL, FAL_VIDEO_MODEL, POSTER_HEIGHT, POSTER_WIDTH, prepare_bookends,
+                                   prepare_poster)
 from app.services.capture import describe_login, origin_of, unpack_login
 from app.services.fixtures import FixtureReplayer, get_set_for_origin
 from app.services.ingest import extract_repos_context, probe_app_url
@@ -31,6 +32,7 @@ _TASKS: Set[asyncio.Task] = set()  # strong refs: asyncio only keeps weak refs t
 _RENDER_SLOT = asyncio.Semaphore(1)
 SCENE_TAIL_SEC = 0.4  # breathing room after each narration line
 BOOKEND_VOICE_DELAY_SEC = 0.4  # the intro/outro line starts after the title fades in
+COVER_GRACE_SEC = 20  # a poster still painting when the cut is done gets this long, then the job ships without it
 TERMINAL = ("completed", "failed")
 STEP_LABELS = {
     "repos": "Reading the repositories", "scrape": "Exploring the live app", "audience": "Researching the customer",
@@ -216,6 +218,7 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
     music_task: Optional[asyncio.Task] = None
     music_skipped: Optional[Callable[[str], None]] = None
     review_task: Optional[asyncio.Task] = None
+    poster_task: Optional[asyncio.Task] = None
     bookend_mode: Optional[str] = None
     background: List[asyncio.Task] = []  # optional work (warm-up, cover, music, review): cancelled before completion
     job_dir: Optional[Path] = None
@@ -333,11 +336,15 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
         step("storyboard", "running")
         log("Planning the storyboard...")
         want_music = feature_on("MUSIC") and bool(get_secret("FAL_KEY"))
-        # Title cards: always for a personalized run ("Made for Acme"); for a generic run only with FEATURE_COVER=1.
-        title_cards = not req.ai_clips and (brief is not None or feature_on("COVER", default=False))
+        # Cover art: one FLUX still per run, the poster (and the title cards' background). Title cards: always for a
+        # personalized run ("Made for Acme"); for a generic run only with FEATURE_TITLE_CARDS=1.
+        cover_off = ("FAL_KEY not set" if not get_secret("FAL_KEY")
+                     else "FEATURE_COVER is off" if not feature_on("COVER") else None)
+        title_cards = not req.ai_clips and (brief is not None or feature_on("TITLE_CARDS", default=False))
         storyboard, note = await generate_storyboard(
             repo_info, app_info, req.target_seconds, req.voice_style, ", ".join(req.repo_urls),
             ai_clips=req.ai_clips, audience=brief, title_cards=title_cards, want_music=want_music,
+            want_cover=cover_off is None,
         )
         log(note)
         job.storyboard = storyboard
@@ -390,14 +397,19 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
         bookend_mode = "video" if req.ai_clips else "cards" if title_cards else None
         if bookend_mode != "video":
             step("ai_clips", "skipped", detail="Not requested in this run")
+        overrides = (audience.bookend_overrides(brief, storyboard.project_name, req.app_url, req.target_seconds)
+                     if brief is not None else None)
+        if cover_off:
+            storyboard.cover = f"skipped: {cover_off}"
+            step("cover", "skipped", detail=cover_off + ("; the title cards sit on a gradient" if bookend_mode == "cards" else ""))
         if bookend_mode:
-            overrides = (audience.bookend_overrides(brief, storyboard.project_name, req.app_url, req.target_seconds)
-                         if brief is not None else None)
             if overrides:
                 log(f"Intro card: \"{overrides['intro']['kicker']}\"; outro card: \"{overrides['outro']['title']}\" -> "
                     f"{overrides['outro']['subtitle']}")
             if bookend_mode == "cards":
-                step("cover", "running", detail=f"Title cards for {brief.company}" if brief is not None else FAL_IMAGE_MODEL)
+                if not cover_off:
+                    step("cover", "running", detail=f"Title cards and poster for {brief.company}" if brief is not None
+                         else f"Title cards and poster · {FAL_IMAGE_MODEL}")
             else:
                 step("ai_clips", "running", detail=f"Personalized for {brief.company}" if brief is not None else None)
                 log(f"Generating the AI intro and outro with fal.ai ({FAL_VIDEO_MODEL})..." if get_secret("FAL_KEY")
@@ -405,18 +417,48 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
             bookend_task = asyncio.create_task(prepare_bookends(
                 job_dir, storyboard.project_name, storyboard.tagline, req.app_url, req.repo_urls, req.voice_style,
                 {"cover": storyboard.cover_visual, "intro": storyboard.intro_visual, "outro": storyboard.outro_visual},
-                log, mode=bookend_mode, overrides=overrides, video=req.ai_clips))
-            if bookend_mode == "cards":
+                log, mode=bookend_mode, overrides=overrides, video=req.ai_clips, paint=cover_off is None))
+            if bookend_mode == "cards" and not cover_off:
                 def _cover_ready(task: asyncio.Task) -> None:  # the thumbnail reaches the trace while the camera rolls
                     if task.cancelled() or task.exception() is not None or job.status in TERMINAL:
                         return  # a failure is reported by _optional when the cut collects the cards
                     ready = task.result()
+                    intro = ready["intro"]
+                    storyboard.cover = intro.note
+                    if not intro.painted:  # FLUX failed: the cards fall back to the gradient and there is no poster
+                        step("cover", "error", message=intro.note[:140])
+                        return
                     d1, d2 = (frame_aligned(max(3.0, ready[k].narration_sec + BOOKEND_VOICE_DELAY_SEC + 0.6))
                               for k in ("intro", "outro"))
-                    step("cover", "done", detail=f"{ready['intro'].note} · intro {d1:.1f}s · outro {d2:.1f}s",
-                         extra={"thumb": ready["intro"].thumb} if ready["intro"].thumb else None)
-                    storyboard.cover = ready["intro"].note
+                    step("cover", "done", detail=f"{intro.note} · intro {d1:.1f}s · outro {d2:.1f}s"
+                                                 + (f" · poster {POSTER_WIDTH}x{POSTER_HEIGHT}" if intro.poster else ""),
+                         extra={"thumb": intro.thumb} if intro.thumb else None)
                 bookend_task.add_done_callback(_cover_ready)
+        if bookend_mode != "cards" and not cover_off:  # no title cards: the poster is its own small task
+            step("cover", "running", detail=f"The video's poster · {FAL_IMAGE_MODEL}")
+            poster_task = asyncio.create_task(prepare_poster(
+                job_dir, storyboard.project_name, storyboard.tagline, storyboard.cover_visual or storyboard.intro_visual,
+                log, card=overrides["intro"] if overrides else None))
+            _TASKS.add(poster_task)
+            poster_task.add_done_callback(_TASKS.discard)
+            background.append(poster_task)
+
+            def _poster_ready(task: asyncio.Task) -> None:  # the thumbnail reaches the trace while the camera rolls
+                if task.cancelled() or job.status in TERMINAL:
+                    return
+                exc = task.exception()
+                if exc is not None:
+                    reason = (str(exc).strip().splitlines() or [type(exc).__name__])[0][:140]
+                    logger.warning("[%s] cover poster failed: %s", job_id, reason)
+                    log(f"Cover art skipped: {reason}")
+                    storyboard.cover = f"skipped: {reason}"
+                    step("cover", "error", message=reason)
+                    return
+                poster = task.result()
+                storyboard.cover = poster.note
+                step("cover", "done", detail=f"{poster.note} · {POSTER_WIDTH}x{POSTER_HEIGHT}",
+                     extra={"thumb": poster.thumb} if poster.thumb else None)
+            poster_task.add_done_callback(_poster_ready)
 
         if want_music:  # fal.ai composes while we narrate and record; ducked under the voice at the final cut
             music_brief, _ = music.brief_for(storyboard.music_prompt, req.voice_style)
@@ -501,6 +543,9 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
             if not bookend_task.done():
                 log("Waiting for the title cards...")
             bookends = await _optional(bookend_task, 60, "cover", "Cover art")  # done row comes from _cover_ready
+            if bookends is None:  # the cards failed outright: the reason is on the cover row
+                row = next((r for r in job.steps if r.id == "cover"), None)
+                storyboard.cover = f"skipped: {row.message if row and row.message else 'the title cards failed'}"
         elif bookend_task is not None:
             if not bookend_task.done():
                 log("Waiting for the AI intro and outro from fal.ai...")
@@ -571,12 +616,27 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
             storyboard.soundtrack = soundtrack
             step("music", "done", detail=soundtrack)
 
+        # 5e. The cover poster: usually painted long ago; a late one gets a short grace, a missing one costs nothing
+        poster_path = bookends["intro"].poster if bookends and bookend_mode == "cards" else None
+        if poster_task is not None:
+            if not poster_task.done():
+                log(f"Waiting up to {COVER_GRACE_SEC}s for the cover art from fal.ai...")
+                await asyncio.wait({poster_task}, timeout=COVER_GRACE_SEC)
+            if not poster_task.done():
+                poster_task.cancel()
+                storyboard.cover = "skipped: took too long"
+                log("Cover art skipped: took too long")
+                step("cover", "error", message="took too long")
+            elif not poster_task.cancelled() and poster_task.exception() is None:
+                poster_path = poster_task.result().path
         media = await describe_media(final_path)
-        final_path = _publish(job_dir, job_id, final_path)  # demo.mp4 into storage; scratch removed
+        final_path = _publish(job_dir, job_id, final_path, poster_path)  # demo.mp4 (+ cover.jpg) into storage
         storyboard.total_duration_sec = round(media["duration"], 2)
         log(f"demo.mp4 ready: {media['duration']:.1f}s, {media['width']}x{media['height']} "
             f"{media['video_codec']}/{media['audio_codec']}, {media['size_bytes'] / 1e6:.1f} MB")
         job.video_url = f"/api/pipeline/video/{job_id}"
+        if (final_path.parent / "cover.jpg").is_file():
+            job.cover_url = f"/api/pipeline/cover/{job_id}"
         step("video", "done", detail=f"{media['duration']:.1f}s, {media['width']}x{media['height']}")
         job.progress = 90
 
@@ -618,15 +678,21 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
             shutil.rmtree(job_dir, ignore_errors=True)
 
 
-def _publish(job_dir: Path, job_id: str, final_path: Path) -> Path:
-    """Moves demo.mp4 from the scratch dir into storage and deletes every intermediate."""
+def _publish(job_dir: Path, job_id: str, final_path: Path, poster: Optional[Path] = None) -> Path:
+    """Moves demo.mp4 (and the poster, as cover.jpg) from the scratch dir into storage; deletes every intermediate."""
     result_dir = storage_root() / job_id
     result_dir.mkdir(parents=True, exist_ok=True)
     target = result_dir / "demo.mp4"
     if final_path.resolve() != target.resolve():
         shutil.copyfile(final_path, target)
+    cover = result_dir / "cover.jpg"
+    if poster is not None and poster.is_file():
+        if poster.resolve() != cover.resolve():
+            shutil.copyfile(poster, cover)
+    else:
+        cover.unlink(missing_ok=True)  # a half-written poster from a cancelled task is not a cover
     for path in job_dir.iterdir():
-        if job_dir == result_dir and path.name in ("demo.mp4", "job.json"):
+        if job_dir == result_dir and path.name in ("demo.mp4", "cover.jpg", "job.json"):
             continue
         try:
             shutil.rmtree(path, ignore_errors=True) if path.is_dir() else path.unlink()
