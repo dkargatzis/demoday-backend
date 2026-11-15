@@ -200,6 +200,8 @@ RULES
    {{"type": "scroll", "value": "down" | "up" | "top" | "bottom"}}
    {{"type": "wait"}}
    Only use selectors from the list. When unsure, scroll or wait instead of guessing.
+   Prefer real interactions over scrolling: when the inventory offers navigation links, buttons or inputs, at least
+   two scenes should click or type (the camera zooms toward every click, which is what makes the video feel alive).
    Keep each scene's total dwell close to its narration time (about 400 ms per word): the scene ends when its
    narration ends, and later actions are skipped.
 5. The browser may be signed in to the user's real account: never sign out, delete, remove, cancel, purchase,

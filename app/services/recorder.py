@@ -36,6 +36,7 @@ MAX_TYPED_CHARS = 160
 LOADER_WAIT_SEC = 4.0
 CLICK_ZOOM, TYPE_ZOOM = 1.45, 1.55
 CLICK_HOLD_SEC = 1.6
+MIN_HOLD_SEC = 0.35  # a click that navigates still gets ring, push-in, page change, pull-back
 
 LogFn = Callable[[str], None]
 FocusTuple = Tuple[float, float, float, float, float]  # (t, cx, cy, zoom, hold)
@@ -433,14 +434,16 @@ class _Director:
     def focus_for(self, scene_start: float, duration: float) -> List[FocusTuple]:
         """Focus events inside a scene, re-based to the scene and cut short by the next view change."""
         out = []
+        scene_end = scene_start + duration
         for t, cx, cy, zoom, hold in self.focus:
-            if not scene_start <= t < scene_start + duration:
+            if not scene_start <= t < scene_end:
                 continue
-            end = min(t + hold, scene_start + duration)
-            for release in self.releases:
+            end = min(t + hold, scene_end)
+            for release in self.releases:  # a navigation or scroll ends the hold early...
                 if t + 0.05 < release < end:
                     end = release
-            if end - t >= 0.4:
+            end = min(max(end, t + MIN_HOLD_SEC), scene_end)  # ...but never below the minimum, or no zoom shows
+            if end - t >= MIN_HOLD_SEC - 0.01:
                 out.append((t - scene_start, cx, cy, zoom, end - t))
         return out
 
