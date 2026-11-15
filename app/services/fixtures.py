@@ -7,6 +7,7 @@ from the set instead of the network, so dashboards show curated, well-populated 
 import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from datetime import date
@@ -96,6 +97,23 @@ def validate_entries(entries: Any) -> List[Dict]:
 # --------------------------------------------------------------------------- capture
 
 
+# Analytics, feature flags and error tracking: never worth replaying, and replaying flags can change the app.
+NOISE_URL = re.compile(r"posthog|/flags/?(\?|$)|/decide/?(\?|$)|/e/?\?|segment\.io|sentry|analytics|mixpanel|amplitude|"
+                       r"hotjar|intercom|datadog|googletagmanager|google-analytics|/collect\b|/batch\b|/track\b|"
+                       r"launchdarkly|statsig|split\.io|/telemetry|/metrics\b|/events\b", re.IGNORECASE)
+# Session/auth responses are left disabled by default: replaying a stale one signs the app out.
+AUTH_URL = re.compile(r"/auth\b|/session|/login|/logout|/token|/oauth|/whoami|/me/?(\?|$)|/users?/me|/account\b|/csrf",
+                      re.IGNORECASE)
+
+
+def is_noise(url: str) -> bool:
+    return bool(NOISE_URL.search(url))
+
+
+def is_auth(url: str) -> bool:
+    return bool(AUTH_URL.search(url))
+
+
 def _key(method: str, url: str, post_data: Optional[str]) -> str:
     parsed = urlparse(url)
     base = f"{method.upper()} {parsed.scheme}://{parsed.netloc}{parsed.path}"
@@ -110,9 +128,11 @@ async def capture_fixtures(app_url: str, storage_state: Optional[Dict], settle, 
     `settle` and `declutter` are the recorder's page helpers, so the capture sees the same page the recording will.
     """
     from app.services.netguard import guard_context
-    from app.services.recorder import VIEWPORT, is_risky, launch_chromium
+    from app.services.recorder import (VIEWPORT, is_risky, launch_chromium, session_storage_script,
+                                       split_session_storage)
 
     entries: Dict[str, Dict] = {}
+    storage_state, session_storage = split_session_storage(storage_state)
 
     async def on_response(response) -> None:
         request = response.request
@@ -130,10 +150,14 @@ async def capture_fixtures(app_url: str, storage_state: Optional[Dict], settle, 
             body = json.loads(text)
         except ValueError:
             return
+        if is_noise(request.url):
+            return
         post_data = request.post_data if request.method in ("POST", "PUT", "PATCH") else None
         key = _key(request.method, request.url, post_data)
+        auth = is_auth(request.url)
         entries[key] = {"url": request.url.split("#", 1)[0], "method": request.method, "status": response.status,
-                        "body": body, "post_data": post_data, "enabled": True, "source": "captured"}
+                        "body": body, "post_data": post_data, "enabled": not auth,
+                        "source": "captured (auth endpoint, off by default)" if auth else "captured"}
 
     async with async_playwright() as pw:
         browser = await launch_chromium(pw)
@@ -141,6 +165,8 @@ async def capture_fixtures(app_url: str, storage_state: Optional[Dict], settle, 
             context = await browser.new_context(viewport=VIEWPORT, locale="en-US", storage_state=storage_state,
                                                 service_workers="block")
             await guard_context(context)
+            if session_storage:
+                await context.add_init_script(session_storage_script(session_storage))
             page = await context.new_page()
             page.on("response", lambda r: _spawn(on_response(r)))
             await page.goto(app_url, wait_until="domcontentloaded", timeout=30_000)
@@ -324,7 +350,7 @@ class FixtureReplayer:
         self.by_key: Dict[str, Dict] = {}
         self.by_path: Dict[str, Dict] = {}
         for e in entries:
-            if not e.get("enabled", True):
+            if not e.get("enabled", True) or is_noise(e["url"]):
                 continue
             self.by_key[_key(e["method"], e["url"], e.get("post_data"))] = e
             self.by_path.setdefault(_key(e["method"], e["url"], None), e)

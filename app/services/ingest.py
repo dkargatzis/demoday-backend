@@ -12,7 +12,8 @@ from playwright.async_api import async_playwright
 
 from app.config import GITHUB_API_URL, GITHUB_RAW_URL, get_secret
 from app.services.netguard import guard_context
-from app.services.recorder import VIEWPORT, declutter_page, is_risky, launch_chromium, wait_for_loaders
+from app.services.recorder import (VIEWPORT, declutter_page, is_risky, launch_chromium, session_storage_script,
+                                   split_session_storage, wait_for_loaders)
 
 GITHUB_API = GITHUB_API_URL
 RAW_GITHUB = GITHUB_RAW_URL
@@ -327,9 +328,12 @@ async def probe_app_url(app_url: str, storage_state: Optional[Dict] = None, repl
     async with async_playwright() as pw:
         browser = await launch_chromium(pw)
         try:
-            context = await browser.new_context(viewport=VIEWPORT, locale="en-US", storage_state=storage_state,
+            playwright_state, session_storage = split_session_storage(storage_state)
+            context = await browser.new_context(viewport=VIEWPORT, locale="en-US", storage_state=playwright_state,
                                                 service_workers="block")
             await guard_context(context)
+            if session_storage:
+                await context.add_init_script(session_storage_script(session_storage))
             if replayer is not None:
                 await replayer.install(context)
             page = await context.new_page()

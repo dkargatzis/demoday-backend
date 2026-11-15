@@ -13,7 +13,7 @@ from app.config import get_secret, storage_root, work_root
 from app.models.schemas import JobStatus, PipelineRequest
 from app.services.audio import synthesize_scene_audio, warm_up_fal
 from app.services.bookends import FAL_VIDEO_MODEL, prepare_bookends
-from app.services.capture import origin_of
+from app.services.capture import origin_of, unpack_login
 from app.services.fixtures import FixtureReplayer, get_set_for_origin
 from app.services.ingest import extract_repos_context, probe_app_url
 from app.services.netguard import BlockedURL, ensure_public_url
@@ -30,6 +30,12 @@ _RENDER_SLOT = asyncio.Semaphore(1)
 SCENE_TAIL_SEC = 0.4  # breathing room after each narration line
 BOOKEND_VOICE_DELAY_SEC = 0.4  # the intro/outro line starts after the title fades in
 TERMINAL = ("completed", "failed")
+
+
+def _path_of(url: str) -> str:
+    from urllib.parse import urlparse
+
+    return (urlparse(url).path or "/").rstrip("/") or "/"
 
 
 def _job_logger(job: JobStatus) -> Callable[[str], None]:
@@ -57,7 +63,12 @@ def _user_secrets(user_id: Optional[str], req: PipelineRequest, log: Callable[[s
         log("Recording signed out: saved login turned off for this run")
     elif vault.list_kind(user_id, "app_login"):
         log(f"No saved login for {origin}; recording as a signed-out visitor")
-    return (token.decode() if token else None), (json.loads(state) if state else None)
+    if state is None:
+        return (token.decode() if token else None), None
+    storage_state, session_storage = unpack_login(state)
+    if session_storage:
+        storage_state = dict(storage_state, _session_storage=session_storage)  # carried to the browser contexts
+    return (token.decode() if token else None), storage_state
 
 
 async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional[str] = None) -> None:
@@ -109,6 +120,12 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
             f"{len(app_info['buttons'])} buttons, {len(app_info['inputs'])} inputs")
         if status and status >= 400:
             log(f"Warning: the app answered HTTP {status}; the recording may show an error page")
+        landed = app_info.get("url") or req.app_url
+        if _path_of(landed) != _path_of(req.app_url):
+            log(f"Warning: {req.app_url} redirected to {landed}. "
+                + ("Your saved login may have expired or not apply to this page: open Settings and choose "
+                   "\"Sign in again\", then re-run." if storage_state else
+                   "This page may need a login: save an app login in Settings to record it."))
         if app_info.get("login_form"):
             log("Warning: the app still shows a sign-in form with your saved login; it may have expired. "
                 "Capture the login again in Settings." if storage_state else

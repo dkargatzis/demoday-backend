@@ -35,6 +35,26 @@ def origin_of(url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}".lower()
 
 
+def unpack_login(blob: bytes) -> Tuple[Dict, Dict]:
+    """(playwright storage_state, {origin: sessionStorage items}) from a saved login, old or new format."""
+    import json
+
+    data = json.loads(blob)
+    if "cookies" in data or "origins" in data:  # first format: the bare storage state
+        return data, {}
+    return data.get("storage_state") or {}, data.get("session_storage") or {}
+
+
+def session_storage_script(session_storage: Dict) -> str:
+    """Init script that seeds sessionStorage for matching origins (once per tab)."""
+    import json
+
+    return ("(() => { const data = " + json.dumps(session_storage) + "; const items = data[location.origin];"
+            " if (!items || sessionStorage.getItem('__demoday_seeded')) return;"
+            " for (const [k, v] of Object.entries(items)) sessionStorage.setItem(k, v);"
+            " sessionStorage.setItem('__demoday_seeded', '1'); })();")
+
+
 @dataclass
 class CaptureSession:
     id: str

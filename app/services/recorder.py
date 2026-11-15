@@ -289,6 +289,20 @@ def _short(exc: BaseException) -> str:
 CHROMIUM_ARGS = ["--disable-dev-shm-usage", "--disable-gpu", "--no-first-run"]  # safe in containers (Cloud Run)
 
 
+def split_session_storage(storage_state: Optional[Dict]) -> Tuple[Optional[Dict], Dict]:
+    """Separates the sessionStorage items (carried under `_session_storage`) from Playwright's storage state."""
+    if not storage_state:
+        return storage_state, {}
+    state = dict(storage_state)
+    return state, state.pop("_session_storage", {}) or {}
+
+
+def session_storage_script(session_storage: Dict) -> str:
+    from app.services.capture import session_storage_script as build
+
+    return build(session_storage)
+
+
 async def launch_chromium(pw: Playwright) -> Browser:
     try:
         return await pw.chromium.launch(headless=True, chromium_sandbox=False, args=CHROMIUM_ARGS)
@@ -359,6 +373,7 @@ async def record_session(
     video_dir = Path(tempfile.mkdtemp(prefix="pw-video-", dir=output_path.parent))
     segments: List[SceneSegment] = []
     raw_path = None
+    playwright_state, session_storage = split_session_storage(storage_state)
     try:
         async with async_playwright() as pw:
             browser = await launch_chromium(pw)
@@ -370,11 +385,13 @@ async def record_session(
                     locale="en-US",
                     record_video_dir=str(video_dir),
                     record_video_size=VIEWPORT,
-                    storage_state=storage_state,
+                    storage_state=playwright_state,
                     service_workers="block",  # keeps every request visible to the network guard
                     bypass_csp=True,  # so the injected cursor, ring and label render on strict-CSP sites
                 )
                 await guard_context(context)
+                if session_storage:
+                    await context.add_init_script(session_storage_script(session_storage))
                 if replayer is not None:
                     await replayer.install(context)  # registered last, so it answers before the guard
                     await context.add_init_script("window.__DEMODAY_STAGED__ = true;")

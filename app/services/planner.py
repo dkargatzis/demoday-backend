@@ -134,6 +134,16 @@ def _clean_narration(text: Any) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _scope_rule(app_info: dict) -> str:
+    """When the demo targets a page deep inside the app (a dashboard), keep the storyboard there."""
+    path = urlparse(app_info.get("url") or "").path.rstrip("/")
+    if path.count("/") < 1 or not path:
+        return ""
+    section = "/" + path.strip("/").split("/")[0]
+    return (f" The demo is about the app section under {section}: stay on pages whose path starts with {section} "
+            f"and never visit marketing pages (home, pricing, how-it-works, sign-in).")
+
+
 def _inventory_lines(app_info: dict) -> str:
     lines = []
     for link in app_info.get("links", [])[:25]:
@@ -191,8 +201,9 @@ RULES
 1. Write 4-5 scenes: hook, the problem or input, the core feature in action, the payoff, a closing call to action.
 2. Narration is spoken aloud: plain conversational English, no emojis, markdown, URLs or code.
    About {total_words} words in total (roughly {total_words // 5} per scene). Tone: {TONES.get(voice_style, TONES['energetic_tech'])}.
-3. "route" is the path where a scene starts ("/" for the landing page). Use only "/", paths from the list above, or
-   repository routes. The browser keeps its state between scenes, so a scene can continue where the last one ended.
+3. "route" is the path where a scene starts; "/" means the app page itself ({app_info.get('url', '')}). Use only "/",
+   paths from the list above, or repository routes. The browser keeps its state between scenes, so a scene can
+   continue where the last one ended.{_scope_rule(app_info)}
 4. Actions (each may set "dwell_ms", the pause after it, 500-4000):
    {{"type": "navigate", "value": "/path"}}
    {{"type": "click", "selector": "<selector from the list>"}}

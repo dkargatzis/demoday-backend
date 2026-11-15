@@ -18,7 +18,7 @@ from app import auth, db, vault
 from app.models.schemas import (AppLogin, CaptureStart, ErrorDetail, FixtureSet, FixtureSetSummary, GitHubConnection,
                                 HealthStatus, JobStatus, Ok, PipelineRequest, SettingsOut, ShareLink, _http_url)
 from app.services import cloud, fixtures
-from app.services.capture import CAPTURES, origin_of
+from app.services.capture import CAPTURES, origin_of, unpack_login
 from app.services.capture import VIEWPORT as CAPTURE_VIEWPORT
 from app.services.netguard import BlockedURL, ensure_public_url
 from app.services.orchestrator import JOBS, create_pipeline_job, stream_job_events
@@ -294,9 +294,20 @@ async def finish_capture(capture_id: str, user: Dict = Depends(auth.current_user
     if not cookies and not any(o.get("localStorage") for o in origins):
         raise HTTPException(400, "No session was found yet. Sign in to the app first, then save.")
     last_url = session.page.url if session.page else session.app_url
+    # Some apps keep their access token in sessionStorage, which Playwright's storage state leaves out.
+    session_storage = {}
+    try:
+        if session.page and not session.page.is_closed():
+            items = await session.page.evaluate("() => Object.assign({}, window.sessionStorage)")
+            if isinstance(items, dict) and items:
+                session_storage[origin_of(session.page.url)] = items
+    except Exception:
+        pass
     await CAPTURES.close(session)
-    return vault.put(user["id"], "app_login", session.origin, json.dumps(state),
-                     {"origin": session.origin, "cookie_count": len(cookies), "last_url": last_url})
+    saved = {"storage_state": state, "session_storage": session_storage}
+    return vault.put(user["id"], "app_login", session.origin, json.dumps(saved),
+                     {"origin": session.origin, "cookie_count": len(cookies), "last_url": last_url,
+                      "session_storage_keys": sum(len(v) for v in session_storage.values())})
 
 
 @app.delete("/api/app-logins/capture/{capture_id}", response_model=Ok, tags=["app-logins"], summary="Close the sign-in browser without saving",
@@ -414,7 +425,9 @@ async def capture_fixture(body: FixtureCaptureIn, user: Dict = Depends(auth.curr
     if vault.available():
         try:
             saved = vault.get(user["id"], "app_login", origin)
-            storage_state = json.loads(saved) if saved else None
+            if saved:
+                playwright_state, session_storage = unpack_login(saved)
+                storage_state = dict(playwright_state, _session_storage=session_storage) if session_storage else playwright_state
         except vault.VaultUnavailable:
             storage_state = None
     try:
