@@ -70,7 +70,7 @@ owner.
 **Live updates.** `GET /api/pipeline/events/{job_id}` is a Server-Sent Events stream of typed messages, each with an
 `id`, an `event` name and a JSON `data` body: `job` (`{id, mode}`, first), `step` (`{id, status, label, detail?,
 message?, tool, t, extra?}`; status `running`, `done`, `skipped` or `error`; step ids `repos`, `scrape`, `audience`,
-`understand`, `storyboard`, `plancheck`, `launchpack`, `ai_clips`, `cover`, `music`, `narration`, `record`, `review`,
+`funnels`, `understand`, `storyboard`, `plancheck`, `launchpack`, `ai_clips`, `cover`, `music`, `narration`, `record`, `review`,
 `retake`, `video`, each in its own order only; `tool` is gemini, fal, chromium, ffmpeg or github; `extra` carries
 one-off payloads such as page thumbnails and review verdicts), `log` (`{message}`), `status` (a full
 `JobStatus` snapshot, what the dashboard renders), then `done` (the full job) or `error` (`{message}`) last. The
@@ -83,12 +83,16 @@ the run for one customer: their public site is read for at most 15 s, a source-t
 the intro/outro cards name them, and the launch kit gains `outreach_email` and `linkedin_dm` carrying the literal
 `{{DEMO_LINK}}` placeholder. The job carries `audience` from the 202 on (source `pending` until research finishes).
 
-**Cover poster.** With fal.ai configured, every run paints one FLUX still from Gemini's art direction
-(`storyboard.cover_visual`) under a title the browser typesets: a 1280x720 JPEG kept next to the video and served
-at `GET /api/pipeline/cover/{job_id}` (`job.cover_url`, `coverUrl` in `GET /api/jobs`), for `<video poster>`. A
-personalized run's poster is its "Made for" intro card, the video's first frame. Generic runs get no intro or outro
-cards. `storyboard.cover` says how the poster was made or why it was skipped (no FAL_KEY, `FEATURE_COVER=0`, FLUX
-failed or took too long); the video never depends on it.
+**Cover poster.** Every run frames the product's own screen (a page the probe screenshotted, never one Gemini
+flagged as a sign-in wall or an error) in a browser window under a title the browser typesets; without a screenshot,
+fal.ai FLUX paints the backdrop from Gemini's art direction (`storyboard.cover_visual`). The 1280x720 JPEG is kept
+next to the video and served at `GET /api/pipeline/cover/{job_id}` (`job.cover_url`, `coverUrl` in `GET /api/jobs`),
+for `<video poster>`. A personalized run's poster is its "Made for" intro card, the video's first frame. Generic runs
+get no intro or outro cards. `storyboard.cover` says how the poster was made or why it was skipped.
+
+**Funnels.** Gemini reads the codebase (README, page routes, files named after onboarding, setup, integrations or
+checkout) next to the live app and ranks the product's strongest funnels (step `funnels`, `extra.funnels`); every
+step is a page the probe reached, and the storyboard tours the strongest one in order.
 
 **Errors.** `4xx` responses carry `detail` (a sentence). Validation errors (422) carry `message` (one plain sentence)
 plus Pydantic's per-field `detail`.

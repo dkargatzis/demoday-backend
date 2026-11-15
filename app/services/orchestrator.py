@@ -7,9 +7,11 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlparse
 
 from app import db, vault
 from app.config import capabilities, feature_on, get_secret, storage_root, work_root
+from app.services import funnels as funnels_mod
 from app.services import ledger, music, plancheck, review, vision
 from app.models.schemas import JobStatus, PipelineRequest, StepState
 from app.services import audience
@@ -20,7 +22,7 @@ from app.services.capture import describe_login, origin_of, unpack_login
 from app.services.fixtures import FixtureReplayer, get_set_for_origin
 from app.services.ingest import extract_repos_context, probe_app_url
 from app.services.netguard import BlockedURL, ensure_public_url
-from app.services.planner import generate_launch_kit, generate_storyboard
+from app.services.planner import generate_launch_kit, generate_storyboard, project_name
 from app.services.recorder import fit_dwells, record_session
 from app.services.stitcher import concat_scenes, describe_media, frame_aligned, make_bookend, mux_scene_clip
 
@@ -37,13 +39,15 @@ TERMINAL = ("completed", "failed")
 STEP_LABELS = {
     "repos": "Reading the repositories", "scrape": "Exploring the live app", "audience": "Researching the customer",
     "understand": "Understanding the pages", "storyboard": "Planning the storyboard", "plancheck": "Checking the plan",
-    "launchpack": "Writing the launch kit", "ai_clips": "AI intro and outro", "cover": "Painting the cover art",
+    "launchpack": "Writing the launch kit", "ai_clips": "AI intro and outro", "cover": "Making the cover and title cards",
+    "funnels": "Finding the strongest funnels",
     "music": "Composing the soundtrack", "narration": "Synthesizing narration", "record": "Recording the browser session",
     "review": "Reviewing the footage", "retake": "Retaking a scene", "video": "Assembling demo.mp4",
 }
 STEP_TOOLS = {
     "repos": "github", "scrape": "chromium", "audience": "gemini", "understand": "gemini", "storyboard": "gemini",
     "plancheck": "gemini", "launchpack": "gemini", "ai_clips": "fal", "cover": "fal", "music": "fal", "narration": "fal",
+    "funnels": "gemini",
     "record": "chromium", "review": "gemini", "retake": "chromium", "video": "ffmpeg",
 }
 
@@ -84,14 +88,17 @@ class _Steps:
     def __init__(self, events: JobEvents, job: Optional[JobStatus] = None, t0: Optional[float] = None) -> None:
         self.events, self.job, self.t0 = events, job, t0 if t0 is not None else time.monotonic()
         self.running: List[str] = []
+        self.tools: Dict[str, str] = {}  # a step's tool when this run uses another one (the cover framed by chromium)
 
     def __call__(self, step_id: str, status: str, detail: Optional[str] = None, message: Optional[str] = None,
-                 extra: Optional[Dict[str, Any]] = None) -> None:
+                 extra: Optional[Dict[str, Any]] = None, tool: Optional[str] = None) -> None:
+        if tool:
+            self.tools[step_id] = tool
         if status == "running":
             self.running.append(step_id)
         else:
             self.running = [s for s in self.running if s != step_id]
-        label, tool = STEP_LABELS.get(step_id, step_id), STEP_TOOLS.get(step_id)
+        label, tool = STEP_LABELS.get(step_id, step_id), self.tools.get(step_id) or STEP_TOOLS.get(step_id)
         self._upsert(step_id, status, label, tool, detail, message)
         data: Dict[str, Any] = {"id": step_id, "status": status, "label": label, "tool": tool,
                                 "t": round(time.monotonic() - self.t0, 1)}
@@ -319,7 +326,19 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
             step("audience", "done", detail=audience.step_detail(brief))
         job.progress = 20
 
-        # 1b. Understand: Gemini looks at the page screenshots once; a failure costs one log line, never the demo
+        # 1b. Funnels: Gemini reads the codebase and the live app for the product's strongest paths, beside Understand
+        funnels: List[Dict[str, Any]] = []
+        funnel_task: Optional[asyncio.Task] = None
+        if feature_on("FUNNELS") and get_secret("GEMINI_API_KEY"):
+            evidence = len(repo_info.get("routes") or []) + len(repo_info.get("flow_files") or [])
+            step("funnels", "running", detail=f"{evidence} routes and flow files in the code, {len(pages) + 1} live pages")
+            funnel_task = asyncio.create_task(funnels_mod.find_funnels(repo_info, app_info,
+                                                                       project_name(repo_info, app_info), log))
+            _TASKS.add(funnel_task)
+            funnel_task.add_done_callback(_TASKS.discard)
+            background.append(funnel_task)
+
+        # 1c. Understand: Gemini looks at the page screenshots once; a failure costs one log line, never the demo
         shots = [p for p in [app_info.get("screenshot"), *(pg.get("screenshot") for pg in pages)] if p]
         if feature_on("VISION") and get_secret("GEMINI_API_KEY") and shots:
             step("understand", "running", detail=f"{len(shots)} screenshots → Gemini")
@@ -330,21 +349,31 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
                 log(vision.summary_line(insights))
                 step("understand", "done", detail=" · ".join(f"{i['path']}: {i['purpose']}" for i in insights)[:200],
                      extra={"pages": insights})
+        if funnel_task is not None:
+            found = await _optional(funnel_task, funnels_mod.FUNNEL_TIMEOUT_SEC + 15, "funnels", "Funnels")
+            if found is not None:
+                funnels = found
+                step("funnels", "done", detail=funnels_mod.step_detail(found),
+                     extra=funnels_mod.as_extra(found) if found else None)
 
         # 2. Plan the storyboard; write the launch kit in the background meanwhile
         job.stage = "planning"
         step("storyboard", "running")
         log("Planning the storyboard...")
         want_music = feature_on("MUSIC") and bool(get_secret("FAL_KEY"))
-        # Cover art: one FLUX still per run, the poster (and the title cards' background). Title cards: always for a
-        # personalized run ("Made for Acme"); for a generic run only with FEATURE_TITLE_CARDS=1.
-        cover_off = ("FAL_KEY not set" if not get_secret("FAL_KEY")
-                     else "FEATURE_COVER is off" if not feature_on("COVER") else None)
+        # Cover: the poster and the title cards' backdrop, the product's own screen in a browser frame (a FLUX still
+        # when the probe saved no screenshot). Title cards: always for a personalized run ("Made for Acme"); for a
+        # generic run only with FEATURE_TITLE_CARDS=1.
+        product_shots = _product_shots(app_info, funnels) if feature_on("COVER") else []
+        cover_off = ("FEATURE_COVER is off" if not feature_on("COVER")
+                     else "FAL_KEY not set" if not get_secret("FAL_KEY") and not product_shots else None)
+        cover_tool = "chromium" if product_shots else None
+        host = _display_host(app_info)
         title_cards = not req.ai_clips and (brief is not None or feature_on("TITLE_CARDS", default=False))
         storyboard, note = await generate_storyboard(
             repo_info, app_info, req.target_seconds, req.voice_style, ", ".join(req.repo_urls),
             ai_clips=req.ai_clips, audience=brief, title_cards=title_cards, want_music=want_music,
-            want_cover=cover_off is None,
+            want_cover=cover_off is None and not product_shots, funnels=funnels,
         )
         log(note)
         job.storyboard = storyboard
@@ -409,8 +438,10 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
                     f"{overrides['outro']['subtitle']}")
             if bookend_mode == "cards":
                 if not cover_off:
-                    step("cover", "running", detail=f"Title cards and poster for {brief.company}" if brief is not None
-                         else f"Title cards and poster · {FAL_IMAGE_MODEL}")
+                    source = "the product's own screens" if product_shots else FAL_IMAGE_MODEL
+                    step("cover", "running", detail=(f"Title cards and poster for {brief.company} · {source}"
+                                                     if brief is not None else f"Title cards and poster · {source}"),
+                         tool=cover_tool)
             else:
                 step("ai_clips", "running", detail=f"Personalized for {brief.company}" if brief is not None else None)
                 log(f"Generating the AI intro and outro with fal.ai ({FAL_VIDEO_MODEL})..." if get_secret("FAL_KEY")
@@ -418,7 +449,8 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
             bookend_task = asyncio.create_task(prepare_bookends(
                 job_dir, storyboard.project_name, storyboard.tagline, req.app_url, req.repo_urls, req.voice_style,
                 {"cover": storyboard.cover_visual, "intro": storyboard.intro_visual, "outro": storyboard.outro_visual},
-                log, mode=bookend_mode, overrides=overrides, video=req.ai_clips, paint=cover_off is None))
+                log, mode=bookend_mode, overrides=overrides, video=req.ai_clips, paint=cover_off is None,
+                product_shots=product_shots, window_host=host, theme_color=app_info.get("theme_color") or ""))
             if bookend_mode == "cards" and not cover_off:
                 def _cover_ready(task: asyncio.Task) -> None:  # the thumbnail reaches the trace while the camera rolls
                     if task.cancelled() or task.exception() is not None or job.status in TERMINAL:
@@ -436,10 +468,13 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
                          extra={"thumb": intro.thumb} if intro.thumb else None)
                 bookend_task.add_done_callback(_cover_ready)
         if bookend_mode != "cards" and not cover_off:  # no title cards: the poster is its own small task
-            step("cover", "running", detail=f"The video's poster · {FAL_IMAGE_MODEL}")
+            step("cover", "running", tool=cover_tool, detail="The video's poster · "
+                 + ("the product's own screen" if product_shots else FAL_IMAGE_MODEL))
             poster_task = asyncio.create_task(prepare_poster(
                 job_dir, storyboard.project_name, storyboard.tagline, storyboard.cover_visual or storyboard.intro_visual,
-                log, card=overrides["intro"] if overrides else None))
+                log, card=overrides["intro"] if overrides else None,
+                product_shot=product_shots[0] if product_shots else None, window_host=host,
+                theme_color=app_info.get("theme_color") or ""))
             _TASKS.add(poster_task)
             poster_task.add_done_callback(_TASKS.discard)
             background.append(poster_task)
@@ -677,6 +712,29 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
             logger.warning("[%s] could not write job.json: %s", job_id, exc)
         if job.status == "failed":
             shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def _display_host(app_info: Dict[str, Any]) -> str:
+    """'https://www.warestack.com/dashboard' -> 'warestack.com' (the framed window's address bar)."""
+    host = (urlparse(app_info.get("url") or "").hostname or "").lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _product_shots(app_info: Dict[str, Any], funnels: List[Dict[str, Any]]) -> List[Tuple[Path, str]]:
+    """The product's own screens for the cards and the poster, best first: the landing page, then the strongest
+    funnel's last page (its payoff), then the other explored pages. Pages Gemini flagged (a sign-in wall, an error,
+    an empty state) and a landing page that shows a sign-in form are left out."""
+    found: List[Tuple[Path, str]] = []
+    landing = app_info.get("screenshot")
+    if (landing and not app_info.get("login_form")
+            and (app_info.get("landing_insight") or {}).get("quality") not in vision.FLAGGED):
+        found.append((Path(landing), urlparse(app_info.get("url") or "").path or "/"))
+    pages = [page for page in app_info.get("pages") or []
+             if page.get("screenshot") and (page.get("insight") or {}).get("quality") not in vision.FLAGGED]
+    payoff = funnels[0]["steps"][-1] if funnels else None
+    pages.sort(key=lambda page: page.get("path") != payoff)  # stable: the payoff page first, the rest in order
+    found += [(Path(page["screenshot"]), page.get("path") or "/") for page in pages]
+    return [(path, route) for path, route in found if path.is_file()][:3]
 
 
 def _publish(job_dir: Path, job_id: str, final_path: Path, poster: Optional[Path] = None) -> Path:

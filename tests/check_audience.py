@@ -527,11 +527,12 @@ async def main():
     check("outro card for book_call", outro["kicker"] == "Your next step" and outro["title"] == "Book 15 minutes"
           and outro["subtitle"] == "cal.com/founder/15min" and outro["small"] == "Made for Acme · FastAPI", outro)
     check("outro line asks for the goal without a URL", outro["line"] == "If this would help at Acme, grab fifteen minutes with us at the link on screen.", outro["line"])
-    for goal, title, phrase in (("start_trial", "Start your free trial", "Start a free trial at the link on screen"),
+    for goal, title, phrase in (("book_call", "Worth 15 minutes?", "If this would help at Acme, just reply to my message"),
+                                ("start_trial", "Try it on your own data", "Reply to my message and I'll set up a trial for Acme"),
                                 ("reply", "Reply to this email", "Reply with a time that suits you, Maria, and we'll")):
         card = aud.bookend_overrides(sb.model_copy(update={"goal": goal, "cta_url": None}), "shadcn/ui", "https://ui.shadcn.com/docs", 45)["outro"]
-        check(f"outro for {goal}: title, line, app host when no CTA link", card["title"] == title and card["line"].startswith(phrase)
-              and card["subtitle"] == "ui.shadcn.com/docs", card)
+        check(f"outro for {goal} without a link: a reply ask, the product's host (no deep path)", card["title"] == title
+              and card["line"].startswith(phrase) and card["subtitle"] == "ui.shadcn.com" and "link on screen" not in card["line"], card)
     nameless = aud.bookend_overrides(sb.model_copy(update={"first_name": None, "goal": "reply"}), "FastAPI", "https://x.dev", 60)
     check("no greeting and no name without a first name", nameless["intro"]["line"] == "This is FastAPI, made for Acme."
           and nameless["intro"]["subtitle"] == "A 60-second tour for Head of Platform"
@@ -738,6 +739,31 @@ async def main():
         vercel.model_copy(deep=True))
     check("the storyboard check warns when the narration credits their fact to the product",
           'Warning: scene 1 credits a vercel.com fact to Linear: "Every PR gets a fully functional environment"' in lines, lines)
+
+    print("audience fields: a URL as the company, a name as the website, role lists")
+    typed = Audience(company="https://hubstaff.com/", persona="Platform, Security & DevSecOps Leader", first_name="Aleksandr")
+    check("a URL typed as the company becomes the name, and the website when none was given",
+          typed.company == "Hubstaff" and typed.website == "https://hubstaff.com/", (typed.company, typed.website))
+    other = Audience(company="https://www.acme.co.uk/team", persona="CTO", website="https://acme.example")
+    check("a typed website wins; a second-level domain keeps the brand", other.company == "Acme"
+          and other.website == "https://acme.example", (other.company, other.website))
+    check("a bare name with a dot stays as typed", Audience(company="Booking.com", persona="CTO").company == "Booking.com")
+    for field, value, label in (("website", "Aleksandr Remniov Head of Infrastructure", "Website"), ("cta_url", "book a call", "Link")):
+        try:
+            Audience(company="Hubstaff", persona="CTO", **{field: value})
+            check(f"{field}: not a web address is refused", False)
+        except ValidationError as exc:
+            check(f"{field}: not a web address is refused with a sentence",
+                  sentence(exc) == f"{label} '{value}' is not a web address; use one like hubstaff.com.", sentence(exc))
+    check("role lists keep their commas; a description after a comma is cut",
+          aud.persona_title("Platform, Security & DevSecOps Leader") == "Platform, Security & DevSecOps Leader"
+          and aud.persona_title("Head of Platform, drowning in PR reviews") == "Head of Platform"
+          and aud.persona_title("CTO, Globex") == "CTO", aud.persona_title("Platform, Security & DevSecOps Leader"))
+    cards_for = aud.bookend_overrides(aud.pending_brief(typed), "Warestack", "https://www.warestack.com/dashboard/warestack", 60)
+    check("the screenshot's cards, fixed: Made for Hubstaff, the first name, the full role, a reply outro on the product's host",
+          cards_for["intro"]["kicker"] == "Made for Hubstaff" and cards_for["intro"]["subtitle"] == "A 60-second tour for Aleksandr"
+          and cards_for["intro"]["small"] == "Platform, Security & DevSecOps Leader at Hubstaff"
+          and cards_for["outro"]["title"] == "Worth 15 minutes?" and cards_for["outro"]["subtitle"] == "warestack.com", cards_for)
 
     print("storyboard check")
     sb3 = sb.model_copy(deep=True)

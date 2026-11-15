@@ -8,7 +8,7 @@ import re
 from typing import List, Literal, Optional
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, PrivateAttr, ValidationInfo, field_validator
+from pydantic import BaseModel, Field, PrivateAttr, ValidationInfo, field_validator, model_validator
 
 AudienceGoal = Literal["book_call", "start_trial", "reply"]
 TEXT_LIMITS = {"company": 80, "persona": 300, "first_name": 40, "notes": 600}
@@ -29,14 +29,36 @@ def _http_url(value: str) -> str:
     return value
 
 
-def _optional_http_url(value: Optional[str]) -> Optional[str]:
-    """Blank -> None; a bare host typed in a hurry ("acme.com") becomes https://acme.com; otherwise http(s) only."""
+_HOST = re.compile(r"^[\w-]+(\.[\w-]+)+$")  # letters, digits and hyphens around at least one dot, no spaces
+_FIELD_NAMES = {"website": "Website", "cta_url": "Link"}
+
+
+def _optional_http_url(value: Optional[str], field: str = "website") -> Optional[str]:
+    """Blank -> None; a bare host typed in a hurry ("acme.com") becomes https://acme.com; otherwise http(s) only, and
+    the host must be a web address (a person's name typed into the field is refused with a sentence that says so)."""
     text = (value or "").strip()
     if not text:
         return None
-    if "://" not in text:
-        text = "https://" + text
-    return _http_url(text)
+    candidate = _http_url(text if "://" in text else "https://" + text)  # the scheme first: ftp:// gets that sentence
+    host = candidate.split("://", 1)[1].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0].rsplit("@", 1)[-1]
+    host = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+    if not _HOST.match(host):
+        raise ValueError(f"{_FIELD_NAMES.get(field, field)} {text!r} is not a web address; use one like hubstaff.com")
+    return candidate
+
+
+def _company_from_url(text: str) -> Optional[str]:
+    """'https://www.hubstaff.com/' -> 'Hubstaff' (a URL typed into the company field); None for anything else.
+    A bare "Booking.com" stays as typed: only a scheme or "www." marks it as a web address."""
+    if not re.match(r"^(https?://|www\.)", text, re.IGNORECASE) or " " in text.strip():
+        return None
+    host = (urlparse(text if "://" in text else "https://" + text).hostname or "").lower()
+    labels = [label for label in host.split(".") if label and label != "www"]
+    if len(labels) < 2:
+        return None
+    second_level = len(labels) >= 3 and labels[-2] in ("co", "com", "org", "net", "ac", "gov") and len(labels[-1]) == 2
+    name = labels[-3] if second_level else labels[-2]
+    return name[:1].upper() + name[1:]
 
 
 class Audience(BaseModel):
@@ -64,8 +86,19 @@ class Audience(BaseModel):
 
     @field_validator("website", "cta_url")
     @classmethod
-    def _http_or_none(cls, value: Optional[str]) -> Optional[str]:
-        return _optional_http_url(value)
+    def _http_or_none(cls, value: Optional[str], info: ValidationInfo) -> Optional[str]:
+        return _optional_http_url(value, str(info.field_name))
+
+    @model_validator(mode="after")
+    def _company_not_a_url(self) -> "Audience":
+        """A URL typed as the company ("https://hubstaff.com/") becomes the name on the cards ("Hubstaff") and, when
+        no website was given, the site the research reads."""
+        name = _company_from_url(self.company)
+        if name:
+            if not self.website:
+                self.website = _optional_http_url(self.company)
+            self.company = name
+        return self
 
 
 class AudienceBrief(BaseModel):

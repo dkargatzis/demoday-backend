@@ -119,9 +119,10 @@ async def main():
         check("a generic run has no intro or outro cards", sb.get("intro_sec") == 0 and sb.get("outro_sec") == 0,
               {k: sb.get(k) for k in ("intro_sec", "outro_sec")})
         if (await alice.get("/api/health")).json().get("fal"):
-            check("cover: running -> done, the poster painted from Gemini's art direction",
+            framed = (sb.get("cover") or "").startswith("the product's own screen")
+            check("cover: running -> done, the product's own screen framed (or FLUX from Gemini's art direction)",
                   steps.get("cover") == ["running", "done"] and done.get("cover_url") == f"/api/pipeline/cover/{job_id}"
-                  and (sb.get("cover") or "").startswith("fal.ai") and sb.get("cover_visual"),
+                  and (framed or ((sb.get("cover") or "").startswith("fal.ai") and sb.get("cover_visual"))),
                   {"steps": steps.get("cover"), "cover_url": done.get("cover_url"), "cover": sb.get("cover"),
                    "visual": sb.get("cover_visual")})
             r = await alice.get(f"/api/pipeline/cover/{job_id}")
@@ -130,8 +131,11 @@ async def main():
                   (r.status_code, r.headers.get("content-type"), jpeg_size(r.content), len(r.content)))
             check("bob can't fetch the cover", (await bob.get(f"/api/pipeline/cover/{job_id}")).status_code == 404)
         else:
-            check("no FAL_KEY: cover skipped with the reason, no cover_url", steps.get("cover") == ["skipped"]
-                  and done.get("cover_url") is None and sb.get("cover") == "skipped: FAL_KEY not set", steps.get("cover"))
+            check("no FAL_KEY: the cover frames the product's screen, or is skipped with the reason",
+                  (steps.get("cover") == ["running", "done"] and done.get("cover_url"))
+                  or (steps.get("cover") == ["skipped"] and sb.get("cover") == "skipped: FAL_KEY not set"), steps.get("cover"))
+        check("funnels: ranked from the code and the live app, or skipped with a reason",
+              steps.get("funnels") in (["running", "done"], ["running", "error"]), steps.get("funnels"))
         logs = [e["data"]["message"] for e in events if e["event"] == "log"]
         check("log events mirror job.logs", logs and logs == done["logs"][1:], f"{len(logs)} vs {len(done['logs'])}")
         statuses = [e["data"] for e in events if e["event"] == "status"]

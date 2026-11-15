@@ -149,6 +149,7 @@ async def planner_checks():
         planner._generate_json = saved
         os.environ.pop("GEMINI_API_KEY", None)
     plain, cover = prompts["plain"], prompts["cover"]
+    captured.clear()
     check("without want_cover nothing asks for cover_visual", '"cover_visual"' not in plain)
     start = cover.index('\n   "cover_visual": one or two sentences')
     end = cover.index("user interfaces or people.", start) + len("user interfaces or people.")
@@ -161,6 +162,35 @@ async def planner_checks():
           and "7. The video opens" in prompts["cards"] and "behind its typeset title" not in prompts["cards"])
     check("with AI clips, the poster's art direction sits next to the shot descriptions",
           '"intro_visual"' in prompts["clips+cover"] and prompts["clips+cover"].count('"cover_visual"') == 2)
+    print("planner: the brand, not the repository")
+    cases = [({"name": "core-api"}, {"title": "Engineering standards for GitHub | Warestack", "url": "https://www.warestack.com/x"}, "Warestack"),
+             ({"name": "fastapi"}, {"title": "FastAPI", "url": "https://fastapi.tiangolo.com/"}, "FastAPI"),
+             ({"name": "ui"}, {"title": "shadcn/ui - The Foundation for your Design System", "url": "https://ui.shadcn.com/"}, "shadcn/ui"),
+             ({}, {"title": "Linear – Plan and build products", "url": "https://linear.app/"}, "Linear"),
+             ({"name": "demoday-backend"}, {"title": "DemoDay Launch Studio", "url": "https://demoday-1.europe-west1.run.app/"}, "DemoDay Launch Studio"),
+             ({"name": "core-api"}, {"title": "Home", "url": "https://x.dev/", "site_name": "Acme Cloud"}, "Acme Cloud"),
+             ({"name": "y"}, {"title": "GitHub - x/y", "url": "https://github.com/x/y", "site_name": "GitHub"}, "y"),
+             ({"name": "frontend"}, {"title": "Dashboard", "url": "https://acme-ops.vercel.app/"}, "Acme-ops")]
+    got = [planner.project_name(repo, app) for repo, app, _ in cases]
+    check("site name, the title segment matching the domain, then a non-generic repo name, then the domain",
+          got == [want for _, _, want in cases], got)
+    funnels = [{"name": "PR to enforced standard", "outcome": "A pull request is checked against the org's rules.",
+                "steps": ["/", "/rules"], "evidence": "README; app/dashboard/[org]/rules", "strength": 0.9}]
+    saved, os.environ["GEMINI_API_KEY"] = planner._generate_json, "offline-test-key"
+    planner._generate_json = capture
+    try:
+        await planner.generate_storyboard(repo, info, 60, "energetic_tech", "", funnels=funnels)
+        with_funnels = captured[-1]
+        await planner.generate_storyboard(repo, info, 60, "energetic_tech", "", funnels=[])
+        no_funnels = captured[-1]
+    finally:
+        planner._generate_json = saved
+        os.environ.pop("GEMINI_API_KEY", None)
+    check("funnels: the block sits after the site map, before the rules, and rule 1 tours funnel 1",
+          with_funnels.index("SITE MAP") < with_funnels.index("FUNNELS: THE PRODUCT'S STRONGEST PATHS") < with_funnels.index("RULES")
+          and "1. PR to enforced standard: A pull request is checked against the org's rules. Pages: / -> /rules." in with_funnels
+          and "Tour FUNNEL 1 above in order" in with_funnels, with_funnels[-900:])
+    check("no funnels, no block and no rule (the prompt is unchanged)", no_funnels == plain and "FUNNEL" not in no_funnels)
     sb = planner._sanitize_storyboard({"cover_visual": "  glowing   request paths ", "scenes": [
         {"title": "Hook", "route": "/", "narration": "Hello there."}]}, "X")
     check("cover_visual is cleaned up by the sanitizer", sb.cover_visual == "glowing request paths", sb.cover_visual)

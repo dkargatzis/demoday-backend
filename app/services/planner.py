@@ -12,6 +12,7 @@ from app.config import GEMINI_MODEL, get_secret
 from app.models.audience import AudienceBrief
 from app.models.schemas import Action, LaunchKit, Scene, Storyboard
 from app.services import audience as audience_mod
+from app.services import funnels as funnels_mod
 
 logger = logging.getLogger("demoday.planner")
 
@@ -45,17 +46,61 @@ def _failure_reason(exc: Exception) -> str:
 # --------------------------------------------------------------------------- shared context
 
 
+_TITLE_SEP = re.compile(r"\s+[-|–—:·•]\s+")
+# A repository name that says what the code is (core-api, frontend), never what the product is called.
+_GENERIC_REPO = re.compile(r"^(core|main|app|apps|web|www|site|website|api|apis|frontend|front-end|backend|back-end|"
+                           r"server|client|ui|monorepo|mono|platform|service|services|src|dashboard|landing|repo)"
+                           r"([-_.](api|app|web|ui|frontend|backend|server|client|service|services|core|v\d+|next|react))*$",
+                           re.IGNORECASE)
+_SUFFIX = re.compile(r"([-_.](api|app|web|ui|frontend|backend|server|client|service|core|site|website|monorepo|v\d+))+$",
+                     re.IGNORECASE)
+# Hosts and platforms that never name the product (a site_name of "GitHub" on a repo page, "vercel" in a preview URL).
+_PLATFORMS = {"github", "gitlab", "bitbucket", "vercel", "netlify", "herokuapp", "onrender", "render", "fly", "run",
+              "pages", "appspot", "firebaseapp", "web", "azurewebsites", "cloudfront", "amplifyapp", "railway", "replit",
+              "glitch", "surge", "medium", "notion", "substack", "youtube", "devpost", "producthunt", "huggingface"}
+_SUBDOMAINS = {"www", "app", "dashboard", "docs", "beta", "my", "portal", "console", "ui"}
+
+
+def _squash(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def _host_labels(app_info: dict) -> List[str]:
+    """The live app's host as name candidates: 'app.linear.app' -> ['linear'], 'www.warestack.com' -> ['warestack']."""
+    labels = [label for label in (urlparse(app_info.get("url") or "").hostname or "").lower().split(".") if label]
+    labels = labels[:-1] if len(labels) >= 2 else labels  # the top-level domain never names the product
+    return [label for label in labels if label not in _SUBDOMAINS and label not in _PLATFORMS]
+
+
+def _names_word(candidate: str, text: str) -> bool:
+    pattern = r"(?<![A-Za-z0-9])" + re.escape(candidate.replace("-", " ")) + r"(?![A-Za-z0-9])"
+    return bool(candidate) and re.search(pattern, text.replace("-", " "), re.IGNORECASE) is not None
+
+
 def project_name(repo_info: dict, app_info: dict) -> str:
-    """Display name: the app title's leading segment when it names the repo as a whole word
-    (repo "ui" + "shadcn/ui - The Foundation..." -> shadcn/ui; repo "fastapi" + "FastAPI - FastAPI" -> FastAPI),
-    otherwise the repo name."""
+    """The product's display name, brand first: the title's leading segment when it names the repo (FastAPI,
+    shadcn/ui, "DemoDay Launch Studio" for demoday-backend), the site's own name (og:site_name), a title segment that
+    is the domain's name ("Engineering standards for GitHub | Warestack" on warestack.com -> Warestack), the
+    repository's name unless it only says what the code is (core-api, frontend), then the domain's name."""
     name = (repo_info.get("name") or "").strip()
     title = (app_info.get("title") or "").strip()
-    lead = re.split(r"\s+[-|–—:]\s+", title, maxsplit=1)[0].strip()
+    segments = [segment.strip() for segment in _TITLE_SEP.split(title) if segment.strip()]
+    lead = segments[0] if segments else ""
     if name and lead and len(lead) <= 40:
-        whole_word = r"(?<![A-Za-z0-9])" + re.escape(name.replace("-", " ")) + r"(?![A-Za-z0-9])"
-        if re.search(whole_word, lead.replace("-", " "), re.IGNORECASE):
+        base = _SUFFIX.sub("", name) or name
+        if _names_word(name, lead) or (len(base) >= 3 and _names_word(base, lead)):
             return lead
+    site = (app_info.get("site_name") or "").strip()
+    if site and len(site) <= 40 and len(site.split()) <= 4 and _squash(site) not in _PLATFORMS:
+        return site
+    labels = _host_labels(app_info)
+    for segment in segments:
+        if len(segment) <= 30 and any(_squash(segment) == _squash(label) for label in labels):
+            return segment
+    if name and not _GENERIC_REPO.match(name):
+        return name
+    if labels:
+        return labels[0][:1].upper() + labels[0][1:]
     return name or lead or "This project"
 
 
@@ -186,12 +231,14 @@ async def generate_storyboard(
     repo_info: dict, app_info: dict, target_seconds: int = 60, voice_style: str = "energetic_tech",
     repo_url: str = "", ai_clips: bool = False, audience: Optional[AudienceBrief] = None,
     title_cards: bool = False, want_music: bool = False, want_cover: bool = False,
+    funnels: Optional[List[dict]] = None,
 ) -> Tuple[Storyboard, str]:
     """Returns (storyboard, human-readable note on which planner produced it).
 
     With `ai_clips` or `title_cards`, the intro/outro take part of the runtime; Gemini also describes the AI shots
     (`ai_clips`) or the art behind the typeset cards (`title_cards`, "cover_visual"). `want_music` asks for a
     "music_prompt" for the soundtrack, `want_cover` for a "cover_visual" for the poster (it takes no runtime).
+    `funnels` (funnels.find_funnels, strongest first) adds the FUNNELS block and makes the tour follow the strongest.
     """
     name = project_name(repo_info, app_info)
     bookends_on = ai_clips or title_cards
@@ -210,6 +257,7 @@ async def generate_storyboard(
     else:
         scene_rule = "Write 4-5 scenes: hook, the problem or input, the core feature in action, the payoff, a closing call to action."
         open_rule = ""
+    scene_rule += funnels_mod.scene_rule(funnels, personalized=audience is not None)
     bookend_rule = bookend_json = ""
     if ai_clips:
         bookend_rule = f"""
@@ -262,7 +310,7 @@ INTERACTIVE ELEMENTS ON THE LIVE APP (selectors are verified, use them verbatim;
 {_inventory_lines(app_info)}
 
 SITE MAP: PAGES VISITED WHILE PREPARING THIS BRIEF (each route is reachable; "shows" lists the page's headings)
-{site_map or "- (only the landing page was reachable)"}{audience_block}
+{site_map or "- (only the landing page was reachable)"}{funnels_mod.prompt_section(funnels)}{audience_block}
 
 RULES
 1. {scene_rule}

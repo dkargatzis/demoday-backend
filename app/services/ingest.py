@@ -59,6 +59,7 @@ async def extract_repos_context(repo_urls: List[str], token: Optional[str] = Non
                                        for url, info in zip(urls, infos) if info.get("readme"))
         merged["dependencies"] = _unique(d for info in infos for d in info.get("dependencies", []))[:30]
         merged["routes"] = _unique(r for info in infos for r in info.get("routes", []))[:30]
+        merged["flow_files"] = _unique(f for info in infos for f in info.get("flow_files", []))[:30]
         merged["description"] = next((info["description"] for info in infos if info.get("description")), "")
         merged["language"] = ", ".join(_unique(info.get("language", "") for info in infos))
     merged["repos"] = [{"url": url, "full_name": info.get("full_name") or url, "private": info.get("private", False),
@@ -141,6 +142,7 @@ async def extract_github_context(repo_url: str, token: Optional[str] = None) -> 
 
         paths = [item["path"] for item in (tree or {}).get("tree", []) if item.get("type") == "blob"]
         info["routes"] = derive_routes(paths)
+        info["flow_files"] = flow_files(paths)
         manifests = [m for m in MANIFESTS if m in paths] if paths else list(MANIFESTS)
         for branch_name in ([branch] if branch else ["main", "master"]):
             deps = await _fetch_dependencies(client, owner, repo, branch_name, manifests)
@@ -209,6 +211,22 @@ def _clean_readme(text: str, limit: int = 6000) -> str:
     text = re.sub(r"<[^>]+>", "", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()[:limit]
+
+
+# Files whose names say "a user goes through this": the code-side evidence for the product's funnels.
+_FLOW_WORDS = re.compile(r"onboard|sign-?up|register|welcome|get-?started|getting-?started|setup|connect|integrat|install|"
+                         r"checkout|pricing|billing|subscri|upgrade|trial|invite|import|wizard|first-?run|activat|"
+                         r"quick-?start|new-?project|create", re.IGNORECASE)
+_SOURCE_FILE = re.compile(r"\.(tsx?|jsx?|vue|svelte|py|rb|go|php|ex|kt|swift)$")
+_NOT_PRODUCT = re.compile(r"(^|/)(tests?|__tests__|spec|e2e|cypress|playwright|node_modules|dist|build|vendor|migrations|"
+                          r"fixtures|mocks?|stories|\.github|scripts|docs?)/|\.(test|spec|stories|d)\.", re.IGNORECASE)
+
+
+def flow_files(paths: List[str], limit: int = 25) -> List[str]:
+    """Source files named after a user flow (onboarding, setup, integrations, checkout, invites...), shortest paths
+    first: what the funnel analysis reads as the code's evidence of how users reach the product's outcome."""
+    found = [p for p in paths if _SOURCE_FILE.search(p) and not _NOT_PRODUCT.search(p) and _FLOW_WORDS.search(p)]
+    return sorted(found, key=lambda p: (p.count("/"), len(p)))[:limit]
 
 
 def derive_routes(paths: List[str]) -> List[str]:
@@ -300,6 +318,8 @@ INVENTORY_SCRIPT = r"""
     title: document.title || "",
     hasPassword: Array.from(document.querySelectorAll("input[type=password]")).some(visible),
     description: meta("description") || meta("og:description"),
+    siteName: meta("og:site_name") || meta("application-name") || meta("apple-mobile-web-app-title"),
+    themeColor: meta("theme-color"),
     headings: pick("h1, h2", 12).map(text).filter(Boolean),
     links: pick("a[href]", 120).map((a) => ({
       text: text(a) || a.getAttribute("aria-label") || "", href: a.getAttribute("href") || "", abs: a.href,
@@ -487,7 +507,8 @@ async def probe_app_url(app_url: str, storage_state: Optional[Dict] = None, repl
     origin = urlparse(result["url"]).netloc
     headings = [re.sub(r"[\s¶#🔗]+$", "", h) for h in raw["headings"]]  # drop permalink glyphs
     result.update(title=raw["title"].strip(), description=raw["description"], headings=[h for h in headings if h],
-                  login_form=bool(raw.get("hasPassword")))
+                  login_form=bool(raw.get("hasPassword")), site_name=(raw.get("siteName") or "").strip()[:60],
+                  theme_color=(raw.get("themeColor") or "").strip()[:30])
 
     seen_paths: set = set()
     result["links"] = _link_entries(raw["links"], origin, seen_paths)[:30]

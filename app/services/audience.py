@@ -52,29 +52,39 @@ _MARKDOWN_RE = re.compile(r"[*`|#]|^\s*>+\s?", re.M)
 _URL_RE = re.compile(r"(?:https?://|www\.)[^\s<>\"')\]]+", re.I)
 _TAG_RE = re.compile(r"^\s*\[(site|sender|assumed)\]\s*:?\s*", re.I)
 _PLACEHOLDER_RE = re.compile(r"\{{1,2}\s*DEMO[_ ]?LINK\s*\}{1,2}|\[\s*DEMO[_ ]?LINK\s*\]|<\s*DEMO[_ ]?LINK\s*>", re.I)
-_TITLE_SPLIT = re.compile(r"\s+at\s+|,|;|\s+who\s+|\s+for\s+|\s+in\s+|\s+with\s+|\s[-–—]\s|\(|\n", re.I)
+_TITLE_SPLIT = re.compile(r"\s+at\s+|;|\s+who\s+|\s+for\s+|\s+in\s+|\s+with\s+|\s[-–—]\s|\(|\n", re.I)
+# A comma inside a role list ("Platform, Security & DevSecOps Leader") is part of the title; elsewhere it ends it.
+_ROLE_END = re.compile(r"\b(leader|lead|head|manager|director|engineer|officer|founder|vp|cto|ceo|cio|ciso|cpo|coo|cfo|"
+                       r"architect|owner|designer|developer|analyst|scientist|specialist|consultant|partner|president|"
+                       r"chief|administrator|admin|researcher|strategist|marketer|editor|producer)s?$", re.I)
 _CTA_HEADING = re.compile(r"^(sign|log ?in|get started|contact|subscribe|cookie|accept|skip to)", re.I)
 
 
 @dataclass(frozen=True)
 class Goal:
-    label: str        # "book a call": log lines and prompts
-    title: str        # the outro card's headline
-    spoken: str       # the outro line; {company} and {name} are filled in
-    ask: str          # the next step the outreach asks for, next to the sender's link
-    ask_no_link: str  # the same step when the sender gave no link: a reply, never a booking or a sign-up
+    label: str          # "book a call": log lines and prompts
+    title: str          # the outro card's headline
+    spoken: str         # the outro line; {company} and {name} are filled in
+    ask: str            # the next step the outreach asks for, next to the sender's link
+    ask_no_link: str    # the same step when the sender gave no link: a reply, never a booking or a sign-up
+    no_link_title: str  # the outro card's headline without a link
+    no_link_line: str   # the outro line without a link ({company}, {name})
 
 
 GOALS: Dict[str, Goal] = {
     "book_call": Goal("book a call", "Book 15 minutes",
                       "If this would help at {company}, grab fifteen minutes with us at the link on screen.",
-                      "book a 15-minute call", "Worth a 15-minute call? Reply and I'll send a few times."),
+                      "book a 15-minute call", "Worth a 15-minute call? Reply and I'll send a few times.",
+                      "Worth 15 minutes?",
+                      "If this would help at {company}, just reply to my message and we'll find fifteen minutes."),
     "start_trial": Goal("start a trial", "Start your free trial",
                         "Start a free trial at the link on screen and try it on your own data.", "start a free trial",
-                        "Want to try it on your own data? Reply and I'll set up a trial for you."),
+                        "Want to try it on your own data? Reply and I'll set up a trial for you.",
+                        "Try it on your own data", "Reply to my message and I'll set up a trial for {company}."),
     "reply": Goal("reply to this email", "Reply to this email",
                   "Reply with a time that suits you{name}, and we'll walk through it together.", "reply with a time",
-                  "Reply with a time that suits you and I'll walk you through it."),
+                  "Reply with a time that suits you and I'll walk you through it.", "Reply to this email",
+                  "Reply with a time that suits you{name}, and we'll walk through it together."),
 }
 MISATTRIBUTION_SHARE = 0.6  # a sentence about the product holding this share of a [site] fact's words restates it
 OUTREACH_REWRITE_TIMEOUT_SEC = 30  # the rewrite runs beside the recording; low thinking answers in a few seconds
@@ -738,6 +748,8 @@ async def build_audience(audience: Audience, target_seconds: int, log: Callable[
 def persona_title(persona: str) -> str:
     """The role alone: 'Head of Platform at a 40-person fintech, drowning in...' -> 'Head of Platform'."""
     first = _TITLE_SPLIT.split(persona or "", maxsplit=1)[0]
+    if "," in first and not (len(first.strip(" .:")) <= 48 and _ROLE_END.search(first.strip(" .:"))):
+        first = first.split(",", 1)[0]
     first = re.sub(r"^(a|an|the)\s+", "", first.strip(" .:"), flags=re.I)
     if len(first) > 40:
         first = first[:40].rsplit(" ", 1)[0] if " " in first[:40] else first[:40]
@@ -945,9 +957,11 @@ def bookend_overrides(brief: AudienceBrief, project: str, app_url: str, target_s
         "intro": {"kicker": f"Made for {brief.company}", "title": project,
                   "subtitle": f"A {target_seconds}-second tour for {name or title}",
                   "small": f"{title} at {brief.company}", "line": intro_line},
-        "outro": {"kicker": "Your next step", "title": goal.title, "subtitle": _display_link(brief.cta_url or app_url),
+        "outro": {"kicker": "Your next step", "title": goal.title if brief.cta_url else goal.no_link_title,
+                  "subtitle": _display_link(brief.cta_url) if brief.cta_url else (_host(app_url) or _display_link(app_url)),
                   "small": f"Made for {brief.company} · {project}",
-                  "line": goal.spoken.format(company=_spoken(brief.company), name=f", {name}" if name else "")},
+                  "line": (goal.spoken if brief.cta_url else goal.no_link_line).format(
+                      company=_spoken(brief.company), name=f", {name}" if name else "")},
     }
 
 

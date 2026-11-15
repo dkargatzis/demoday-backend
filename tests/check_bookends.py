@@ -211,13 +211,15 @@ async def main():
     print("prepare_bookends(mode='cards') on a fake FLUX image")
     fake_flux = WORK / "fake_flux.png"
     make_image(fake_flux, "1920x1080", "0x0f4c3a")
-    order, captured = [], {}
+    order, captured, captured_kwargs = [], {}, {}
 
-    async def render(cards, job_dir):
+    async def render(cards, job_dir, **kwargs):
         order.append("render:start")
         captured.clear()
         captured.update(cards)
-        paths = await REAL["_render_cards"](cards, job_dir)
+        captured_kwargs.clear()
+        captured_kwargs.update(kwargs)
+        paths = await REAL["_render_cards"](cards, job_dir, **kwargs)
         order.append("render:done")
         return paths
 
@@ -452,6 +454,66 @@ async def main():
     except RuntimeError as exc:
         check("a FLUX failure propagates (the orchestrator records the reason, skips the step)",
               str(exc).startswith("queue timed out after 90s") and not (jd / "cover.jpg").exists(), exc)
+
+    print("the product's own screens as the backdrop")
+
+    def pixel(path, x, y, fmt="rgb24", size=3):
+        out = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-vf", f"crop=1:1:{x}:{y}", "-f", "rawvideo",
+                              "-pix_fmt", fmt, "-"], capture_output=True, check=True).stdout
+        return tuple(out[:size])
+
+    def row_alpha(path, y):
+        out = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-vf", f"crop=1920:1:0:{y}", "-f", "rawvideo",
+                              "-pix_fmt", "rgba", "-"], capture_output=True, check=True).stdout
+        return max(out[3::4]) if out else 0
+
+    shot_a, shot_b = WORK / "shot_a.jpg", WORK / "shot_b.jpg"
+    for path, colour in ((shot_a, "0xd02020"), (shot_b, "0x2050d0")):
+        ffmpeg("-f", "lavfi", "-i", f"color=c={colour}:s=1920x1080", "-frames:v", "1", "-q:v", "3", "-update", "1", str(path))
+    order.clear()
+    bookends._render_cards, bookends._generate_image, bookends._generate_clip = render, fake_image, must_not
+    bookends.get_secret, bookends.synthesize_scene_audio = fake_key, FakeTTS()
+    jd = WORK / "cards_product"
+    jd.mkdir()
+    logs = []
+    b = await bookends.prepare_bookends(jd, *ARGS, dict(VISUALS), logs.append, mode="cards",
+                                        product_shots=[(shot_a, "/"), (shot_b, "/rules")], window_host="acme.dev",
+                                        theme_color="#5E6AD2")
+    check("the image provider is never called when the product's screens exist", "image" not in order, order)
+    check("each card names the screen it frames", b["intro"].note == "the product's own screen (/) in a browser frame"
+          and b["outro"].note == "the product's own screen (/rules) in a browser frame", (b["intro"].note, b["outro"].note))
+    check("the address bar, the theme glow and both screens reach the renderer", captured_kwargs.get("host") == "acme.dev"
+          and captured_kwargs.get("glow") == "rgba(94,106,210,.42)" and set(captured_kwargs.get("shots") or {}) == {"intro", "outro"},
+          captured_kwargs)
+    intro_px, outro_px, top_px = (pixel(b["intro"].background, 960, 760), pixel(b["outro"].background, 960, 760),
+                                  pixel(b["intro"].background, 960, 150))
+    check("the intro window shows the first screen (red)", intro_px[0] > 150 and max(intro_px[1:]) < 90, intro_px)
+    check("the outro window shows the second screen (blue)", outro_px[2] > 150 and outro_px[0] < 90, outro_px)
+    check("the stage is dark above the window, where the title sits", max(top_px) < 60, top_px)
+    check("the title is typeset above the window, nothing over the screen",
+          row_alpha(b["intro"].overlay, 215) > 200 and row_alpha(b["intro"].overlay, 820) == 0,
+          (row_alpha(b["intro"].overlay, 215), row_alpha(b["intro"].overlay, 820)))
+    check("framed counts as painted: the intro card is the 1280x720 poster", b["intro"].painted and b["outro"].painted
+          and b["intro"].poster == jd / "cover.jpg" and dims(jd / "cover.jpg") == (1280, 720))
+    order.clear()
+    jd = WORK / "cards_unreadable"
+    jd.mkdir()
+    b = await bookends.prepare_bookends(jd, *ARGS, dict(VISUALS), logs.append, mode="cards",
+                                        product_shots=[(WORK / "missing.jpg", "/")])
+    check("an unreadable screenshot falls back to the FLUX still", "image" in order
+          and b["intro"].note == f"fal.ai FLUX background ({bookends.FAL_IMAGE_MODEL})", (order, b["intro"].note))
+    order.clear()
+    bookends.get_secret = lambda name: ""
+    jd = WORK / "poster_product"
+    jd.mkdir()
+    p = await bookends.prepare_poster(jd, "FastAPI", "Fast, modern Python web framework.", None, logs.append,
+                                      product_shot=(shot_a, "/docs"), window_host="acme.dev")
+    check("the poster frames the product's screen with no key and no image call",
+          p.path == jd / "cover.jpg" and dims(p.path) == (1280, 720) and "image" not in order
+          and p.note == "the product's own screen (/docs) in a browser frame" and p.thumb, (p.note, order))
+    check("theme colours: a real colour glows, white, black, grey and junk fall back to emerald",
+          bookends.glow_colour("#5E6AD2") == "rgba(94,106,210,.42)" and bookends.glow_colour("#0a0") == "rgba(0,170,0,.42)"
+          and {bookends.glow_colour(c) for c in ("#ffffff", "#000", "#888888", "", "teal", "#12")} == {bookends.HOUSE_GLOW})
     restore()
 
     if os.getenv("LIVE") == "1":

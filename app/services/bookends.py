@@ -7,8 +7,10 @@ plus one narrated line in the same voice as the demo. Without fal.ai, or when it
 zooming gradient, so the demo never depends on it. The cards are rendered FIRST, before any fal.ai wait, so Chromium
 never runs during the timed browser recording that overlaps this work.
 
-The cover poster (cover.jpg, 1280x720) is the painted intro card in cards mode; a run without title cards gets the
-same kind of FLUX still under a typeset title from `prepare_poster`, with the same rules.
+The cover poster (cover.jpg, 1280x720) is the finished intro card in cards mode; a run without title cards gets the
+same design from `prepare_poster`. Whenever the probe saved screenshots, the backdrop is the product itself: its own
+screen in a browser window on a dark stage, the title typeset above it (`product_shots`); the FLUX still is the
+fallback for a run without screenshots.
 """
 import asyncio
 import base64
@@ -19,7 +21,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 import httpx
@@ -44,6 +46,8 @@ FAL_IMAGE_MODEL = os.getenv("FAL_IMAGE_MODEL", "fal-ai/flux/schnell")
 FAL_IMAGE_TIMEOUT_SEC = 90
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 POSTER_WIDTH, POSTER_HEIGHT = 1280, 720  # cover.jpg, the video's poster
+HOUSE_GLOW = "rgba(16,185,129,.30)"  # emerald, when the site declares no usable theme colour
+ProductShot = Tuple[Path, str]  # (a page screenshot from the probe, the route it shows)
 NO_TEXT = ("No text, letters, numbers, logos, watermarks, screens, user interfaces, people, faces or hands anywhere "
            "in the frame.")
 NEGATIVE = "text, letters, words, numbers, logo, watermark, user interface, screen, people, face, hands, blur, distortion"
@@ -68,8 +72,8 @@ class Bookend:
     video: Optional[Path] = None   # the AI clip, when generation succeeded
     note: str = ""
     thumb: Optional[str] = None    # base64 320 px JPEG of the finished intro card, for the one-off step event only
-    painted: bool = False          # the FLUX still is the background (cards mode)
-    poster: Optional[Path] = None  # cover.jpg: the painted intro card at POSTER_WIDTH (cards mode)
+    painted: bool = False          # a real backdrop (the product's own screen, or the FLUX still) in cards mode
+    poster: Optional[Path] = None  # cover.jpg: the finished intro card at POSTER_WIDTH (cards mode)
 
 
 @dataclass
@@ -195,7 +199,32 @@ h1 { font-size: 120px; line-height: 1.04; margin: 0; font-weight: 800; letter-sp
 p { font-size: 46px; line-height: 1.3; margin: 30px 0 0; font-weight: 500; color: rgba(255,255,255,.9);
   text-shadow: 0 4px 26px rgba(0,0,0,.65); }
 small { display: block; font-size: 32px; margin-top: 18px; color: rgba(255,255,255,.7); font-weight: 500; }
-</style></head><body><div class="scrim"></div><div class="wrap">__CONTENT__</div></body></html>"""
+body.hero .scrim { display: none; }
+body.hero .wrap { justify-content: flex-start; padding-top: 100px; }
+body.hero .kicker { margin-bottom: 22px; }
+body.hero h1 { font-size: 104px; }
+body.hero p { font-size: 40px; margin-top: 22px; }
+body.hero small { font-size: 28px; margin-top: 12px; }
+</style></head><body class="__LAYOUT__"><div class="scrim"></div><div class="wrap">__CONTENT__</div></body></html>"""
+# The product itself as the backdrop: its own screen in a browser window, tilted back on a dark stage, the title above.
+STAGE_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
+html, body { margin: 0; width: 1920px; height: 1080px; overflow: hidden; }
+body { background: radial-gradient(1300px 720px at 50% 112%, __GLOW__ 0%, rgba(7,8,11,0) 72%),
+  radial-gradient(1000px 520px at 50% -18%, rgba(255,255,255,.07) 0%, rgba(7,8,11,0) 70%), #07080b; }
+.stage { position: absolute; left: 50%; top: 448px; width: 1360px; margin-left: -680px;
+  transform: perspective(2600px) rotateX(9deg); transform-origin: 50% 0; }
+.window { border-radius: 16px; overflow: hidden; background: #0d0f13; border: 1px solid rgba(255,255,255,.14);
+  box-shadow: 0 50px 140px rgba(0,0,0,.65), 0 0 0 1px rgba(0,0,0,.5); }
+.bar { height: 40px; background: #15171c; display: flex; align-items: center; gap: 9px; padding: 0 18px;
+  border-bottom: 1px solid rgba(255,255,255,.06); }
+.bar i { width: 12px; height: 12px; border-radius: 50%; background: #3b3f47; display: block; }
+.bar span { margin-left: 18px; padding: 4px 16px; border-radius: 8px; background: #0d0f13; color: #9aa1ad;
+  font: 500 15px -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif; }
+.window img { display: block; width: 100%; }
+.fade { position: absolute; left: 0; right: 0; bottom: 0; height: 380px;
+  background: linear-gradient(to bottom, rgba(7,8,11,0) 0%, rgba(7,8,11,.86) 70%, #07080b 100%); }
+</style></head><body><div class="stage"><div class="window"><div class="bar"><i></i><i></i><i></i><span>__ADDRESS__</span>
+</div><img src="__SHOT__"></div></div><div class="fade"></div></body></html>"""
 OPAQUE_BACKGROUND = ("radial-gradient(1100px 650px at 28% 30%, #0f4c3a 0%, rgba(8,9,12,0) 70%), "
                      "radial-gradient(900px 600px at 75% 75%, #0c2f4a 0%, rgba(8,9,12,0) 70%), #08090c")
 
@@ -207,23 +236,61 @@ def _title_content(kicker: str, title: str, subtitle: str, small: str = "") -> s
     return "".join(parts)
 
 
-async def _render_cards(cards: Dict[str, str], job_dir: Path) -> Dict[str, Dict[str, Path]]:
-    """Renders each card twice: a transparent overlay for the AI clip and an opaque fallback background."""
+def glow_colour(theme_color: str) -> str:
+    """The site's declared theme colour as the stage's glow when it is a real colour (not near-white, near-black or
+    grey); the house emerald otherwise."""
+    match = re.fullmatch(r"#?([0-9a-fA-F]{6}|[0-9a-fA-F]{3})", (theme_color or "").strip())
+    if match:
+        digits = match.group(1) if len(match.group(1)) == 6 else "".join(c * 2 for c in match.group(1))
+        r, g, b = (int(digits[i:i + 2], 16) for i in (0, 2, 4))
+        luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
+        saturation = (max(r, g, b) - min(r, g, b)) / max(r, g, b) if max(r, g, b) else 0
+        if 0.08 < luminance < 0.9 and saturation > 0.25:
+            return f"rgba({r},{g},{b},.42)"
+    return HOUSE_GLOW
+
+
+def _data_uri(path: Optional[Path]) -> Optional[str]:
+    try:
+        data = Path(path).read_bytes() if path else b""
+    except OSError:
+        return None
+    if not data:
+        return None
+    mime = "image/png" if data[:4] == b"\x89PNG" else "image/jpeg"
+    return f"data:{mime};base64," + base64.b64encode(data).decode("ascii")
+
+
+async def _render_cards(cards: Dict[str, str], job_dir: Path, shots: Optional[Dict[str, ProductShot]] = None,
+                        host: str = "", glow: str = HOUSE_GLOW) -> Dict[str, Dict[str, Path]]:
+    """Renders each card twice: a transparent overlay (the typeset text) and an opaque background.
+
+    With `shots` (kind -> (screenshot, route)), that card's background is the product framed in a browser window on
+    a dark stage (its address bar reads `host` + route), the text sits above it, and paths[kind]["product"] is the
+    screenshot used; otherwise the background is the gradient and the text is centred."""
     paths: Dict[str, Dict[str, Path]] = {}
     async with async_playwright() as pw:
         browser = await launch_chromium(pw)
         try:
             page = await browser.new_page(viewport={"width": 1920, "height": 1080})
             for kind, content in cards.items():
+                shot = (shots or {}).get(kind)
+                uri = _data_uri(shot[0]) if shot else None
                 paths[kind] = {}
-                for variant, background, omit in (("overlay", "transparent", True),
-                                                  ("background", OPAQUE_BACKGROUND, False)):
-                    markup = content if variant == "overlay" else ""
-                    await page.set_content(TITLE_HTML.replace("__BACKGROUND__", background)
-                                           .replace("__CONTENT__", markup))
-                    path = job_dir / f"{kind}_{variant}.png"
-                    await page.screenshot(path=str(path), omit_background=omit)
-                    paths[kind][variant] = path
+                await page.set_content(TITLE_HTML.replace("__BACKGROUND__", "transparent")
+                                       .replace("__LAYOUT__", "hero" if uri else "").replace("__CONTENT__", content))
+                paths[kind]["overlay"] = job_dir / f"{kind}_overlay.png"
+                await page.screenshot(path=str(paths[kind]["overlay"]), omit_background=True)
+                if uri:
+                    address = host + (shot[1] if shot[1] not in ("", "/") else "")
+                    await page.set_content(STAGE_HTML.replace("__GLOW__", glow).replace("__ADDRESS__", html.escape(address))
+                                           .replace("__SHOT__", uri))
+                    paths[kind]["product"] = Path(shot[0])
+                else:
+                    await page.set_content(TITLE_HTML.replace("__BACKGROUND__", OPAQUE_BACKGROUND)
+                                           .replace("__LAYOUT__", "").replace("__CONTENT__", ""))
+                paths[kind]["background"] = job_dir / f"{kind}_background.png"
+                await page.screenshot(path=str(paths[kind]["background"]), omit_background=False)
         finally:
             await browser.close()
     return paths
@@ -269,7 +336,9 @@ def _reason(exc: BaseException) -> str:
 async def prepare_bookends(job_dir: Path, project: str, tagline: str, app_url: str, repo_urls, voice_style: str,
                            visuals: Dict[str, Optional[str]], log, mode: str = "video",
                            overrides: Optional[Dict[str, Dict[str, str]]] = None,
-                           video: bool = True, paint: bool = True) -> Dict[str, Bookend]:
+                           video: bool = True, paint: bool = True,
+                           product_shots: Sequence[ProductShot] = (), window_host: str = "",
+                           theme_color: str = "") -> Dict[str, Bookend]:
     """Title cards, narration and the fal.ai media for the intro and outro.
 
     `mode="video"`: one fal.ai text-to-video clip per card when FAL_KEY is set and `video` is True (today's AI clips);
@@ -277,6 +346,8 @@ async def prepare_bookends(job_dir: Path, project: str, tagline: str, app_url: s
     `mode="cards"`: one fal.ai FLUX still from `visuals["cover"]` (Gemini's art direction; `intro` or the template
     when absent) is the background of both cards; the video endpoint is never called. The painted intro card also
     becomes the poster (`Bookend.poster`, cover.jpg); `paint=False` (FEATURE_COVER=0) keeps both cards on the gradient.
+    `product_shots` ((screenshot, route), best first) replace the FLUX still in cards mode: the intro frames the first
+    screen, the outro the second (or the first again), and fal.ai is not called for the backdrop.
     `overrides` replaces a card's text and spoken line per kind: {"intro": {"kicker", "title", "subtitle", "small",
     "line"}}, e.g. "Made for Acme". The cards are rendered before any fal.ai wait (see the module docstring).
     """
@@ -301,8 +372,12 @@ async def prepare_bookends(job_dir: Path, project: str, tagline: str, app_url: s
                                          card.get("subtitle") or "", card.get("small") or "")
     key = get_secret("FAL_KEY")
 
+    shots: Dict[str, ProductShot] = {}
+    if mode == "cards" and paint and product_shots:
+        shots = {"intro": product_shots[0], "outro": product_shots[1] if len(product_shots) > 1 else product_shots[0]}
     # Chromium first, before any fal.ai wait: this task overlaps the narration and the timed recording.
-    card_paths = await _render_cards(cards, job_dir)
+    card_paths = await _render_cards(cards, job_dir, shots=shots, host=window_host or host, glow=glow_colour(theme_color))
+    framed = {kind: "product" in card_paths[kind] for kind in ("intro", "outro")}
 
     async def clip(kind: str) -> Optional[Path]:
         if not key or not video:
@@ -312,7 +387,7 @@ async def prepare_bookends(job_dir: Path, project: str, tagline: str, app_url: s
                                       timeout=FAL_VIDEO_TIMEOUT_SEC + 30)
 
     async def cover() -> Optional[Path]:
-        if not key or not paint:
+        if not key or not paint or all(framed.values()):  # the product's own screens need no painted still
             return None
         visual = " ".join((visuals.get("cover") or visuals.get("intro") or TEMPLATE_VISUALS["cover"]).split())
         log(f"Cover art: fal.ai {'FLUX' if 'flux' in FAL_IMAGE_MODEL else 'image model'} ({FAL_IMAGE_MODEL}) painting "
@@ -338,7 +413,11 @@ async def prepare_bookends(job_dir: Path, project: str, tagline: str, app_url: s
         media, background, note = None, card_paths[kind]["background"], ""
         try:
             media = await tasks[kind]
-            if mode == "cards":
+            if mode == "cards" and framed[kind]:
+                background, media = card_paths[kind]["background"], None
+                route = next(r for p, r in product_shots if Path(p) == card_paths[kind]["product"])
+                note = f"the product's own screen ({route}) in a browser frame"
+            elif mode == "cards":
                 if media:
                     background = media
                     note = f"fal.ai {'FLUX' if 'flux' in FAL_IMAGE_MODEL else 'image'} background ({FAL_IMAGE_MODEL})"
@@ -359,7 +438,7 @@ async def prepare_bookends(job_dir: Path, project: str, tagline: str, app_url: s
         bookends[kind] = Bookend(kind=kind, narration=job_dir / f"{kind}.wav", narration_sec=duration,
                                  overlay=card_paths[kind]["overlay"], background=background,
                                  video=media if mode != "cards" else None, note=note,
-                                 painted=bool(mode == "cards" and media))
+                                 painted=bool(mode == "cards" and (media or framed[kind])))
         log(f"{kind.capitalize()}: {note}")
     if mode == "cards":
         intro = bookends["intro"]
@@ -370,23 +449,36 @@ async def prepare_bookends(job_dir: Path, project: str, tagline: str, app_url: s
 
 
 async def prepare_poster(job_dir: Path, project: str, tagline: str, visual: Optional[str], log,
-                         card: Optional[Dict[str, str]] = None) -> Poster:
+                         card: Optional[Dict[str, str]] = None, product_shot: Optional[ProductShot] = None,
+                         window_host: str = "", theme_color: str = "") -> Poster:
     """The cover poster of a run without title cards: one fal.ai FLUX still under a title the browser typesets.
 
     `card` (a personalized run's intro override: kicker, title, subtitle, small) replaces the default "Product demo"
     title. The rules of the cards hold: the overlay is rendered first (Chromium is done before the timed recording),
     and the image model never sees the product name. Raises when FAL_KEY is missing or FLUX fails; the caller
-    records the reason and skips the step.
+    records the reason and skips the step. With `product_shot` the backdrop is the product's own screen in a browser
+    frame (no fal.ai call, no key needed).
     """
     key = get_secret("FAL_KEY")
-    if not key:
+    if not key and not product_shot:
         raise RuntimeError("FAL_KEY not set")
     if card:
         content = _title_content(card.get("kicker") or "", card.get("title") or project, card.get("subtitle") or "",
                                  card.get("small") or "")
     else:
         content = _title_content("Product demo", project, tagline.strip().rstrip(".")[:110])
-    overlay = (await _render_cards({"poster": content}, job_dir))["poster"]["overlay"]
+    rendered = (await _render_cards({"poster": content}, job_dir, shots={"poster": product_shot} if product_shot else None,
+                                    host=window_host, glow=glow_colour(theme_color)))["poster"]
+    overlay = rendered["overlay"]
+    if "product" in rendered:
+        background = rendered["background"]
+        path = await _compose_card(background, overlay, job_dir / "cover.jpg", POSTER_WIDTH, quality=3)
+        thumb = await _card_thumb(background, overlay, job_dir / "cover_card.jpg")
+        note = f"the product's own screen ({product_shot[1]}) in a browser frame"
+        log(f"Cover poster ready: {note}, {POSTER_WIDTH}x{POSTER_HEIGHT}, {path.stat().st_size / 1e3:.0f} kB")
+        return Poster(path=path, note=note, thumb=thumb)
+    if not key:
+        raise RuntimeError("FAL_KEY not set and the screenshot could not be read")
     visual = " ".join((visual or TEMPLATE_VISUALS["cover"]).split())
     painter = "FLUX" if "flux" in FAL_IMAGE_MODEL else "image model"
     log(f"Cover art: fal.ai {painter} ({FAL_IMAGE_MODEL}) painting '{visual[:100].rstrip('. ')}' for the poster")

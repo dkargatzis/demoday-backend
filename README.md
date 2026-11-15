@@ -42,7 +42,7 @@ cp .env.example .env
 | `GITHUB_TOKEN` | Optional server-wide fallback when a user hasn't saved their own token. |
 | `STORAGE_DIR` | Job media, `job.json` files and the `demoday.db` database. Relative paths resolve against this folder (default `storage`). |
 | `CORS_ORIGINS` | Comma-separated browser origins allowed to call the API with the session cookie, default the dashboard (`http://localhost:3000`, `http://127.0.0.1:3000`) and Launch Kit (`http://localhost:3780`, `http://127.0.0.1:3780`). |
-| `FEATURE_<NAME>` | Optional agent steps, each skipped when its key is missing: `VISION`, `PLANCHECK`, `COVER` (the poster), `MUSIC`, `REVIEW` are on by default (`=0` turns one off); `RETAKE` and `TITLE_CARDS` (intro/outro cards on generic runs) are off (`=1` turns one on). |
+| `FEATURE_<NAME>` | Optional agent steps, each skipped when its key is missing: `VISION`, `FUNNELS`, `PLANCHECK`, `COVER` (the poster and card backdrop), `MUSIC`, `REVIEW` are on by default (`=0` turns one off); `RETAKE` and `TITLE_CARDS` (intro/outro cards on generic runs) are off (`=1` turns one on). |
 
 ### 4. Run Server
 ```bash
@@ -78,13 +78,22 @@ browser (never drawn by the model), and the demo's voice reads one line over eac
 each bookend falls back to the typeset title on a slowly zooming gradient. The storyboard's `intro_sec` tells the
 dashboard where scene 1 starts. Two clips cost about $0.50 with the default model.
 
-### Cover poster
+### Cover poster and title cards
 
-With `FAL_KEY` set, every run paints one fal.ai FLUX still from Gemini's art direction (`storyboard.cover_visual`) and
-the browser typesets the product name and tagline on it, so the model never draws text. The 1280x720 JPEG is served
-at `GET /api/pipeline/cover/{job_id}` for `<video poster>`. On a personalized run the poster is the "Made for" intro card,
-the video's first frame; a generic run gets no intro or outro cards. `storyboard.cover` says how it was made or why it
-was skipped (no `FAL_KEY`, `FEATURE_COVER=0`, FLUX failed or took too long). The video never waits on it for more than 20 s.
+The poster and the title cards show the product itself: one of its own screens (the landing page first, then the
+strongest funnel's last page; never a page Gemini flagged as a sign-in wall or an error) in a browser window on a dark
+stage, with the product's name typeset above it by the browser. Without a screenshot, fal.ai FLUX paints the backdrop
+from Gemini's art direction instead. The name is the brand, not the repository: the site's own name, the title segment
+that matches its domain ("... | Warestack" on warestack.com), then the repository's name unless it only says what the
+code is (`core-api`). The 1280x720 JPEG is served at `GET /api/pipeline/cover/{job_id}` for `<video poster>`. On a
+personalized run the poster is the "Made for" intro card; a generic run gets no intro or outro cards.
+
+### Funnels
+
+Before planning, Gemini reads the codebase (README, page routes, files named after onboarding, setup, integrations or
+checkout) next to the live app and ranks up to three funnels: the paths a user takes to the outcome the product exists
+for. Every step must be a page the probe reached; the storyboard tours the strongest funnel in order (on a
+personalized run, the one that fits the viewer best). `FEATURE_FUNNELS=0` turns it off.
 
 ### Polished walkthroughs
 
