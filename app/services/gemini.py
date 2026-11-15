@@ -6,7 +6,7 @@ parsing rules live in one place.
 import asyncio
 import json
 import re
-from typing import Any, Sequence
+from typing import Any, Optional, Sequence
 
 from google import genai
 from google.genai import types
@@ -18,10 +18,12 @@ GEMINI_TIMEOUT_SEC = 90
 
 
 async def generate_json(prompt: str, *, images: Sequence[bytes] = (), deep: bool = False,
-                        timeout_sec: int = GEMINI_TIMEOUT_SEC, purpose: str = "gemini") -> Any:
+                        thinking: Optional[str] = None, timeout_sec: int = GEMINI_TIMEOUT_SEC,
+                        purpose: str = "gemini") -> Any:
     """Parsed JSON from Gemini for `prompt`, with `images` (JPEG bytes) shown before the text.
 
-    `deep` asks for the model's highest thinking level and falls back to the plain call when the model has none.
+    `deep` asks for the model's highest thinking level; `thinking` sets another level ("minimal" for fast checks).
+    Either falls back to the plain call when the model has no thinking levels.
     """
     key = get_secret("GEMINI_API_KEY")
     if not key:
@@ -29,9 +31,10 @@ async def generate_json(prompt: str, *, images: Sequence[bytes] = (), deep: bool
     contents: list = [types.Part.from_bytes(data=image, mime_type="image/jpeg") for image in images]
     contents.append(prompt)
     configs = [types.GenerateContentConfig(response_mime_type="application/json")]
-    if deep:
+    level = "high" if deep else thinking
+    if level:
         configs.insert(0, types.GenerateContentConfig(response_mime_type="application/json",
-                                                      thinking_config=types.ThinkingConfig(thinking_level="high")))
+                                                      thinking_config=types.ThinkingConfig(thinking_level=level)))
     client = genai.Client(api_key=key, http_options=types.HttpOptions(timeout=timeout_sec * 1000))
     try:
         async with ledger.call("gemini", purpose, GEMINI_MODEL):
