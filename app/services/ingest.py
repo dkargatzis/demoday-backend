@@ -2,6 +2,7 @@
 import asyncio
 import json
 import re
+import time
 import tomllib
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urlparse
@@ -19,6 +20,9 @@ GITHUB_API = GITHUB_API_URL
 RAW_GITHUB = GITHUB_RAW_URL
 MANIFESTS = ("package.json", "requirements.txt", "pyproject.toml")
 MAX_REPOS = 5
+BRIEF_MAX_PAGES = 6     # pages explored beyond the landing page while preparing the brief
+BRIEF_BUDGET_SEC = 25   # ...within this much time
+MAX_INVENTORY_LINKS = 40
 
 
 # --------------------------------------------------------------------------- GitHub
@@ -311,10 +315,92 @@ def _quote(value: str) -> str:
 # IDs generated per render (React useId ":r1:" / "_r_1_" / "«r1»", React Aria, Radix, Headless UI, MUI, long counters)
 # change on every page load, so a selector built from one never matches during recording.
 _GENERATED_ID = re.compile(r":r\w+:|_r_\w+_|«r\w+»|react-aria\d+|radix-|headlessui-|^mui-|\d{5,}", re.IGNORECASE)
+# Account pages are never worth a scene: the brief doesn't explore them and the planner isn't offered them as routes.
+_ACCOUNT_PATH = re.compile(r"/(sign-?in|log-?in|sign-?up|register|auth|oauth|password|verify|account|settings|billing)(/|$|\?)",
+                           re.IGNORECASE)
 
 
 def _stable_id(value: str) -> bool:
     return bool(value) and not _GENERATED_ID.search(value)
+
+
+def _scope_section(url: str) -> str:
+    """'/dashboard' for a demo that targets a page deep inside the app; '' for a landing page."""
+    path = urlparse(url).path.rstrip("/")
+    return "/" + path.strip("/").split("/")[0] if path.count("/") >= 1 and path else ""
+
+
+def _link_entries(raw_links: List[Dict], origin: str, seen_paths: set, on: Optional[str] = None) -> List[Dict]:
+    """Inventory entries for the planner: same-origin, labelled, non-destructive links, one per path."""
+    entries = []
+    for link in raw_links:
+        href, label = link["href"].strip(), link["text"].strip()
+        target = urlparse(link["abs"])
+        if (not href or not label or '"' in label or href.startswith(("#", "javascript:", "mailto:", "tel:"))
+                or target.scheme not in ("http", "https") or target.netloc != origin
+                or is_risky(label=label, url=href)):  # never offer sign-out or destructive links to the planner
+            continue
+        path = target.path or "/"
+        if target.query:
+            path += "?" + target.query
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        entry = {"text": label, "path": path, "selector": f'a[href="{_quote(href)}"]', "nav": bool(link.get("nav"))}
+        if on:
+            entry["on"] = on
+        entries.append(entry)
+    return entries
+
+
+async def _explore_pages(page, landing_url: str, raw_links: List[Dict]) -> List[Dict[str, Any]]:
+    """Visits the app's own pages (navigation links first, inside the demo's section) so the brief can say what
+    each one shows. Bounded by BRIEF_MAX_PAGES and BRIEF_BUDGET_SEC."""
+    origin = urlparse(landing_url).netloc
+    landing_path = urlparse(landing_url).path.rstrip("/") or "/"
+    section = _scope_section(landing_url)
+    candidates, seen = [], {landing_path}
+    for link in sorted(raw_links, key=lambda item: not item.get("nav")):
+        href, label = link["href"].strip(), link["text"].strip()
+        target = urlparse(link["abs"])
+        path = target.path.rstrip("/") or "/"
+        if (not href or not label or href.startswith(("#", "javascript:", "mailto:", "tel:"))
+                or target.scheme not in ("http", "https") or target.netloc != origin or path in seen
+                or is_risky(label=label, url=href) or (section and not path.startswith(section))
+                or _ACCOUNT_PATH.search(path)):
+            continue
+        seen.add(path)
+        candidates.append((link["abs"], path + ("?" + target.query if target.query else ""), href, label))
+    pages: List[Dict[str, Any]] = []
+    started = time.monotonic()
+    for abs_url, route, href, label in candidates:
+        if len(pages) >= BRIEF_MAX_PAGES or time.monotonic() - started > BRIEF_BUDGET_SEC:
+            break
+        try:
+            await page.goto(abs_url, wait_until="domcontentloaded", timeout=15_000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=3000)
+            except PlaywrightError:
+                pass
+            await wait_for_loaders(page)
+            await declutter_page(page)
+            info = await page.evaluate(INVENTORY_SCRIPT)
+        except PlaywrightError:
+            continue
+        landed = urlparse(page.url).path.rstrip("/") or "/"
+        if landed == landing_path or any(landed == urlparse(p["url"]).path.rstrip("/") for p in pages):
+            continue  # bounced back (a sign-in wall or an alias of a page already seen)
+        headings = [re.sub(r"[\s¶#🔗]+$", "", h) for h in info["headings"]]
+        pages.append({
+            "path": route, "url": page.url, "title": info["title"].strip(), "link_text": label,
+            "open_selector": f'a[href="{_quote(href)}"]',
+            "headings": [h for h in headings if h][:6],
+            "buttons": [b["text"].strip() for b in info["buttons"] if b["text"].strip() and not is_risky(label=b["text"])][:6],
+            "inputs": [(i["placeholder"] or i["aria"] or i["name"]) for i in info["inputs"]
+                       if (i["placeholder"] or i["aria"] or i["name"])][:4],
+            "raw_links": info["links"],
+        })
+    return pages
 
 
 async def probe_app_url(app_url: str, storage_state: Optional[Dict] = None, replayer=None) -> Dict[str, Any]:
@@ -324,7 +410,7 @@ async def probe_app_url(app_url: str, storage_state: Optional[Dict] = None, repl
     password field, which usually means a sign-in wall. Returns an `error` key when the page can't be loaded at all.
     """
     result: Dict[str, Any] = {"url": app_url, "status": 0, "title": "", "description": "", "headings": [],
-                              "links": [], "buttons": [], "inputs": [], "login_form": False}
+                              "links": [], "buttons": [], "inputs": [], "login_form": False, "pages": []}
     async with async_playwright() as pw:
         browser = await launch_chromium(pw)
         try:
@@ -353,6 +439,7 @@ async def probe_app_url(app_url: str, storage_state: Optional[Dict] = None, repl
             await declutter_page(page)  # inventory the page as the recording will show it
             result["url"] = page.url
             raw = await page.evaluate(INVENTORY_SCRIPT)
+            pages = [] if raw.get("hasPassword") else await _explore_pages(page, result["url"], raw["links"])
         finally:
             await browser.close()
 
@@ -361,24 +448,14 @@ async def probe_app_url(app_url: str, storage_state: Optional[Dict] = None, repl
     result.update(title=raw["title"].strip(), description=raw["description"], headings=[h for h in headings if h],
                   login_form=bool(raw.get("hasPassword")))
 
-    seen_paths = set()
-    for link in raw["links"]:
-        href, label = link["href"].strip(), link["text"].strip()
-        target = urlparse(link["abs"])
-        if (not href or not label or '"' in label or href.startswith(("#", "javascript:", "mailto:", "tel:"))
-                or target.scheme not in ("http", "https") or target.netloc != origin
-                or is_risky(label=label, url=href)):  # never offer sign-out or destructive links to the planner
-            continue
-        path = target.path or "/"
-        if target.query:
-            path += "?" + target.query
-        if path in seen_paths:
-            continue
-        seen_paths.add(path)
-        result["links"].append({"text": label, "path": path, "selector": f'a[href="{_quote(href)}"]',
-                                "nav": bool(link.get("nav"))})
-        if len(result["links"]) >= 30:
-            break
+    seen_paths: set = set()
+    result["links"] = _link_entries(raw["links"], origin, seen_paths)[:30]
+    for explored in pages:  # links that only exist deeper in the app, so the planner can chain pages
+        for entry in _link_entries(explored.pop("raw_links", []), origin, seen_paths, on=explored["path"]):
+            if len(result["links"]) >= MAX_INVENTORY_LINKS:
+                break
+            result["links"].append(entry)
+    result["pages"] = pages
 
     for button in raw["buttons"]:
         label = button["text"].strip()

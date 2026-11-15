@@ -212,7 +212,10 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
         status = app_info.get("status")
         log(f"Live app \"{app_info.get('title') or 'untitled'}\" (HTTP {status}): {len(app_info['links'])} links, "
             f"{len(app_info['buttons'])} buttons, {len(app_info['inputs'])} inputs")
-        step("scrape", "done", detail=f"HTTP {status}: {app_info.get('title') or 'untitled'}")
+        pages = app_info.get("pages") or []
+        if pages:
+            log(f"Brief: explored {len(pages)} more page(s) for the storyboard: " + ", ".join(p["path"] for p in pages))
+        step("scrape", "done", detail=f"HTTP {status}: {app_info.get('title') or 'untitled'}; {len(pages) + 1} page(s) explored")
         if status and status >= 400:
             log(f"Warning: the app answered HTTP {status}; the recording may show an error page")
         landed = app_info.get("url") or req.app_url
@@ -237,7 +240,7 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
         log(note)
         job.storyboard = storyboard
         scenes = storyboard.scenes
-        log(f"Storyboard: {len(scenes)} scenes for \"{storyboard.project_name}\"")
+        log(f"Storyboard: {len(scenes)} scenes across {len({s.route for s in scenes})} page(s) for \"{storyboard.project_name}\"")
         step("storyboard", "done", detail=f"{len(scenes)} scenes; {note}")
         step("launchpack", "running")
         kit_task = asyncio.create_task(

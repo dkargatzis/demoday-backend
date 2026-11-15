@@ -32,20 +32,27 @@ TONES = {
 # --------------------------------------------------------------------------- Gemini plumbing
 
 
-async def _generate_json(prompt: str) -> Any:
+async def _generate_json(prompt: str, deep: bool = False) -> Any:
+    """`deep` asks the model for its highest thinking level (the storyboard deserves the extra seconds)."""
     key = get_secret("GEMINI_API_KEY")
     if not key:
         raise RuntimeError("GEMINI_API_KEY not configured")
     client = genai.Client(api_key=key, http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_SEC * 1000))
+    configs = [types.GenerateContentConfig(response_mime_type="application/json")]
+    if deep:
+        configs.insert(0, types.GenerateContentConfig(response_mime_type="application/json",
+                                                      thinking_config=types.ThinkingConfig(thinking_level="high")))
     try:
-        response = await asyncio.wait_for(
-            client.aio.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(response_mime_type="application/json"),
-            ),
-            timeout=GEMINI_TIMEOUT_SEC + 10,
-        )
+        for config in configs:
+            try:
+                response = await asyncio.wait_for(
+                    client.aio.models.generate_content(model=GEMINI_MODEL, contents=prompt, config=config),
+                    timeout=GEMINI_TIMEOUT_SEC + 10,
+                )
+                break
+            except Exception as exc:  # a model without thinking levels: fall back to the plain call
+                if config is configs[-1] or "thinking" not in str(exc).lower():
+                    raise
     finally:
         await client.aio.aclose()
     text = (response.text or "").strip()
@@ -144,10 +151,26 @@ def _scope_rule(app_info: dict) -> str:
             f"and never visit marketing pages (home, pricing, how-it-works, sign-in).")
 
 
+def _site_map_lines(app_info: dict) -> str:
+    lines = []
+    for page in app_info.get("pages", []):
+        bits = [f'- route {page["path"]} - "{page["title"]}"']
+        if page.get("headings"):
+            bits.append("shows: " + " | ".join(page["headings"]))
+        if page.get("buttons"):
+            bits.append("buttons: " + ", ".join(page["buttons"]))
+        if page.get("inputs"):
+            bits.append("inputs: " + ", ".join(page["inputs"]))
+        bits.append(f'open with: click {page["open_selector"]}')
+        lines.append("; ".join(bits))
+    return "\n".join(lines)
+
+
 def _inventory_lines(app_info: dict) -> str:
     lines = []
-    for link in app_info.get("links", [])[:25]:
-        lines.append(f'- link "{link["text"]}" -> path {link["path"]} | selector: {link["selector"]}')
+    for link in app_info.get("links", [])[:40]:
+        where = f' (on {link["on"]})' if link.get("on") else ""
+        lines.append(f'- link "{link["text"]}" -> path {link["path"]}{where} | selector: {link["selector"]}')
     for button in app_info.get("buttons", [])[:12]:
         lines.append(f'- button "{button["text"]}" | selector: {button["selector"]}')
     for field in app_info.get("inputs", [])[:8]:
@@ -169,6 +192,19 @@ async def generate_storyboard(
     name = project_name(repo_info, app_info)
     narrated_sec = target_seconds - TAIL_ALLOWANCE_SEC - (BOOKEND_ALLOWANCE_SEC if ai_clips else 0)
     total_words = max(30, int(narrated_sec * WORDS_PER_SECOND.get(voice_style, 2.4)))
+    pages = app_info.get("pages") or []
+    site_map = _site_map_lines(app_info)
+    if pages:
+        scene_rule = (f"Write {'5-6' if len(pages) >= 4 else '4-5'} scenes as a tour of the product: a hook on the landing page, "
+                      f"then every scene starts on a different site-map page (its \"route\" is that page's path), so the "
+                      f"video shows at least {min(4, len(pages) + 1)} distinct pages. Never spend two scenes on the same "
+                      "page, and prefer pages whose headings show real product value over settings and lists of links. "
+                      "Say what each page shows using its headings; never claim a feature that no page shows.")
+        open_rule = ("\n   A scene that starts on a new page opens it with a click on that page's \"open with\" link as its "
+                     "first action (dwell 1500-2500), then scrolls or clicks within the page.")
+    else:
+        scene_rule = "Write 4-5 scenes: hook, the problem or input, the core feature in action, the payoff, a closing call to action."
+        open_rule = ""
     bookend_rule = bookend_json = ""
     if ai_clips:
         bookend_rule = f"""
@@ -194,11 +230,14 @@ README EXCERPT
 {repo_info.get('readme', '')[:3500]}
 >>>
 
-INTERACTIVE ELEMENTS ON THE LIVE LANDING PAGE (selectors are verified, use them verbatim)
+INTERACTIVE ELEMENTS ON THE LIVE APP (selectors are verified, use them verbatim; "(on /x)" means the link appears on that page)
 {_inventory_lines(app_info)}
 
+SITE MAP: PAGES VISITED WHILE PREPARING THIS BRIEF (each route is reachable; "shows" lists the page's headings)
+{site_map or "- (only the landing page was reachable)"}
+
 RULES
-1. Write 4-5 scenes: hook, the problem or input, the core feature in action, the payoff, a closing call to action.
+1. {scene_rule}
 2. Narration is spoken aloud: plain conversational English, no emojis, markdown, URLs or code.
    About {total_words} words in total (roughly {total_words // 5} per scene). Tone: {TONES.get(voice_style, TONES['energetic_tech'])}.
 3. "route" is the path where a scene starts; "/" means the app page itself ({app_info.get('url', '')}). Use only "/",
@@ -210,7 +249,7 @@ RULES
    {{"type": "type", "selector": "<input selector>", "value": "text to type"}}  (end value with \\n to press Enter)
    {{"type": "scroll", "value": "down" | "up" | "top" | "bottom"}}
    {{"type": "wait"}}
-   Only use selectors from the list. When unsure, scroll or wait instead of guessing.
+   Only use selectors from the list. When unsure, scroll or wait instead of guessing.{open_rule}
    Prefer real interactions over scrolling: when the inventory offers navigation links, buttons or inputs, at least
    two scenes should click or type (the camera zooms toward every click, which is what makes the video feel alive).
    Keep each scene's total dwell close to its narration time (about 400 ms per word): the scene ends when its
@@ -223,8 +262,8 @@ RULES
 """
     if get_secret("GEMINI_API_KEY"):
         try:
-            storyboard = _sanitize_storyboard(await _generate_json(prompt), name)
-            return storyboard, f"Storyboard planned by Gemini ({GEMINI_MODEL})"
+            storyboard = _sanitize_storyboard(await _generate_json(prompt, deep=True), name)
+            return storyboard, f"Storyboard planned by Gemini ({GEMINI_MODEL}, thinking level high)"
         except Exception as exc:
             logger.warning("Gemini storyboard failed: %s", exc)
             reason = f"Gemini ({GEMINI_MODEL}) failed: {_failure_reason(exc)}"
