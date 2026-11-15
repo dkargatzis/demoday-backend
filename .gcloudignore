@@ -9,3 +9,4 @@ __pycache__/
 .env.*
 test_e2e.py
 README.md
+tests/

@@ -136,6 +136,14 @@ python test_e2e.py --ai-clips             # with the AI intro/outro (uses fal.ai
 ```
 Runs a full job in-process and checks the output: H.264/yuv420p 1920x1080, AAC 48 kHz, audio/video durations within 100 ms, fast start, and a populated launch kit. Exits non-zero on any failure.
 
+### 6. Checks
+```bash
+python tests/run_checks.py                          # every offline suite in about 30 s: no keys, no network
+python tests/live_contract.py http://127.0.0.1:8000  # the Launch Kit contract on a running server (one 15 s job)
+python tests/live_personalized.py http://127.0.0.1:8000
+```
+See [tests/README.md](tests/README.md) for what each suite covers.
+
 ---
 
 ## Google Cloud Run (live deployment)

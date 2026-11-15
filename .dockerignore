@@ -8,3 +8,4 @@ __pycache__/
 *.pyc
 .git/
 test_e2e.py
+tests/
