@@ -391,7 +391,8 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
         step("plancheck", "done", detail=plancheck.describe(verified, found, revised, repair_sec, left, fixed, reason))
         step("launchpack", "running")
         kit_task = asyncio.create_task(
-            generate_launch_kit(storyboard, repo_info, app_info, ", ".join(req.repo_urls), req.app_url, audience=brief)
+            generate_launch_kit(storyboard, repo_info, app_info, ", ".join(req.repo_urls), req.app_url, audience=brief,
+                                log=log)
         )
         # Bookends: "video" = the AI clips (ai_clips); "cards" = typeset title cards on a fal.ai FLUX still (step "cover").
         bookend_mode = "video" if req.ai_clips else "cards" if title_cards else None

@@ -3,7 +3,7 @@ import asyncio
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 
@@ -240,8 +240,8 @@ async def generate_storyboard(
    video's cover, behind its typeset title. Evoke the product's domain with abstract shapes, light, materials and
    colour. It must contain no text, letters, numbers, logos, screens, user interfaces or people."""
         cover_json = ' "cover_visual": "...",'
-    audience_block = audience_mod.prompt_section(audience)  # "" for None: the generic prompt stays byte-identical
-    audience_rule = audience_mod.storyboard_rule(audience)
+    audience_block = audience_mod.prompt_section(audience, name)  # "" for None: the generic prompt stays byte-identical
+    audience_rule = audience_mod.storyboard_rule(audience, name)
     prompt = f"""You are directing a {target_seconds}-second product demo video for a hackathon submission.
 A headless browser (1920x1080) performs your actions on the LIVE app while a voiceover reads your narration.
 
@@ -392,9 +392,10 @@ def _template_storyboard(repo_info: dict, app_info: dict) -> Storyboard:
 
 async def generate_launch_kit(
     storyboard: Storyboard, repo_info: dict, app_info: dict, repo_url: str, app_url: str,
-    audience: Optional[AudienceBrief] = None,
+    audience: Optional[AudienceBrief] = None, log: Optional[Callable[[str], None]] = None,
 ) -> Tuple[LaunchKit, str]:
-    """Returns (launch kit, human-readable note on which generator produced it)."""
+    """Returns (launch kit, human-readable note on which generator produced it). `log` gets the outreach check's
+    lines on a personalized run."""
     name, tagline = storyboard.project_name, storyboard.tagline
     narration = "\n".join(f"{i + 1}. {s.title}: {s.narration}" for i, s in enumerate(storyboard.scenes))
     prompt = f"""Write launch collateral for a hackathon project. Be specific to THIS project and use only facts from
@@ -410,7 +411,7 @@ README excerpt:
 {repo_info.get('readme', '')[:3000]}
 >>>
 Demo video narration:
-{narration}{audience_mod.launch_kit_section(audience)}
+{narration}{audience_mod.launch_kit_section(audience, name)}
 
 Return JSON with exactly these keys:
 - "readme_markdown": a polished GitHub README in Markdown: title and tagline, links to the live demo and repo,
@@ -425,8 +426,9 @@ Return JSON with exactly these keys:
         try:
             data = await _generate_json(prompt, purpose="launch kit")
             kit = _sanitize_launch_kit(data)
-            return kit, (f"Launch kit written by Gemini ({GEMINI_MODEL})"
-                         + audience_mod.attach_outreach(kit, data, audience, storyboard, app_url))
+            outreach = await audience_mod.attach_checked_outreach(
+                kit, data, audience, storyboard, app_url, own_text=audience_mod.product_text(repo_info, app_info), log=log)
+            return kit, f"Launch kit written by Gemini ({GEMINI_MODEL})" + outreach
         except Exception as exc:
             logger.warning("Gemini launch kit failed: %s", exc)
             reason = f"Gemini ({GEMINI_MODEL}) failed: {_failure_reason(exc)}"
