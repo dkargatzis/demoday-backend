@@ -34,4 +34,4 @@ EXPOSE 8080
 
 # One worker only: jobs, the SQLite database and the recording slot live in this process.
 # Only Cloud Run's proxy can reach the container, so its X-Forwarded-* headers are trusted (https:// redirects).
-CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1 --proxy-headers --forwarded-allow-ips='*'"]
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1 --proxy-headers --forwarded-allow-ips='*' --timeout-graceful-shutdown 5"]

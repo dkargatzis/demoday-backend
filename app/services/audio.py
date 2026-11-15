@@ -22,6 +22,7 @@ logger = logging.getLogger("demoday.audio")
 
 # fal.ai's PlayHT endpoints were retired (404); Kokoro is fal-hosted. Schema: prompt/voice/speed -> audio.url
 FAL_TTS_ENDPOINT = "fal-ai/kokoro/american-english"
+FAL_TTS_TIMEOUT_SEC = 60  # a short clip; when fal.ai is backed up, fall back sooner rather than wait 2 minutes
 
 # voice_style -> (Kokoro voice, Kokoro speed, local TTS words-per-minute)
 VOICE_PRESETS = {
@@ -82,7 +83,7 @@ async def _fal_tts(text: str, tmp_dir: Path, voice: str, speed: float, key: str)
     result = await client.subscribe(
         FAL_TTS_ENDPOINT,
         arguments={"prompt": text, "voice": voice, "speed": speed},
-        client_timeout=120,
+        client_timeout=FAL_TTS_TIMEOUT_SEC,
     )
     audio = (result or {}).get("audio") or {}
     url = audio.get("url") if isinstance(audio, dict) else None

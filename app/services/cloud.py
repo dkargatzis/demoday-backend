@@ -88,7 +88,8 @@ async def google_tts(text: str, dest: Path, voice_style: str, credentials=None) 
     voice_name, rate = GOOGLE_VOICES.get(voice_style, GOOGLE_VOICES["energetic_tech"])
 
     def synthesize() -> Path:
-        client = texttospeech.TextToSpeechClient(credentials=credentials)
+        # REST, not gRPC: gRPC's background threads make the later ffmpeg fork() stall the whole process.
+        client = texttospeech.TextToSpeechClient(credentials=credentials, transport="rest")
         response = client.synthesize_speech(
             input=texttospeech.SynthesisInput(text=text),
             voice=texttospeech.VoiceSelectionParams(language_code="en-US", name=voice_name),
