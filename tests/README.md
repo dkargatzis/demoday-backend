@@ -21,6 +21,7 @@ servers. Each is a plain script that prints one line per check and exits 1 on a 
 | `check_core.py` | Vault, password hashing, netguard, request validation, private and multi-repo ingest against a fake GitHub |
 | `check_music.py` | The soundtrack: the ducked mix (loudness, A/V sync, the video stream copied), fail-soft compose on fake fal responses, the final-cut wrapper |
 | `check_plancheck.py` | The plan check before filming: selectors and routes verified against the inventory, the Gemini repair (faked), pacing fit to the measured voice |
+| `check_rehearsal.py` | The dry run against a fake app in real Chromium (links followed, buttons and forms found but never performed, unverified steps after them, missing, covered, risky and failing steps dropped) and frozen scripts (`from_job`: owner only, videos only, one line per scene) |
 | `check_review.py` | The footage review: contact sheets, sanitizing Gemini's verdicts, the retake gate |
 | `check_vision.py` | The vision brief: screenshots, page insights, thumbnails, the planner's insight lines |
 

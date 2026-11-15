@@ -44,6 +44,21 @@ class PipelineRequest(BaseModel):
                                                     "open the pull request it blocked\"). The tour follows it, and the funnel "
                                                     "that matches it ranks first. Echoed as `options.instructions`")
 
+    from_job: Optional[str] = Field(default=None, pattern=r"^[a-f0-9]{8,32}$",
+                                    description="Re-record one of your finished videos from its script: the same pages, "
+                                                "steps and narration, no planning again (a frozen script). The job's "
+                                                "customer brief and launch kit are reused")
+    narration: Optional[List[str]] = Field(default=None, max_length=12,
+                                           description="With from_job: a replacement line per scene, in order (an empty "
+                                                       "string keeps that scene's line)")
+
+    @field_validator("narration")
+    @classmethod
+    def _plain_lines(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is None:
+            return None
+        return [re.sub(r"\s+", " ", re.sub(r"[\x00-\x1f\x7f]+", " ", str(line or ""))).strip()[:600] for line in value]
+
     @field_validator("instructions")
     @classmethod
     def _plain_instructions(cls, value: Optional[str]) -> Optional[str]:

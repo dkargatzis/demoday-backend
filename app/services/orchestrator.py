@@ -14,8 +14,8 @@ from app.config import capabilities, feature_on, get_secret, storage_root, work_
 from app.services import analysis as analysis_mod
 from app.services import capabilities as capabilities_mod
 from app.services import funnels as funnels_mod
-from app.services import ledger, music, plancheck, review, vision
-from app.models.schemas import JobStatus, PipelineRequest, StepState
+from app.services import ledger, music, plancheck, rehearsal, review, vision
+from app.models.schemas import JobStatus, PipelineRequest, StepState, Storyboard
 from app.services import audience
 from app.services.audio import synthesize_scene_audio, warm_up_fal
 from app.services.bookends import (FAL_IMAGE_MODEL, FAL_VIDEO_MODEL, POSTER_HEIGHT, POSTER_WIDTH, prepare_bookends,
@@ -43,14 +43,14 @@ STEP_LABELS = {
     "understand": "Understanding the pages", "storyboard": "Planning the storyboard", "plancheck": "Checking the plan",
     "launchpack": "Writing the launch kit", "ai_clips": "AI intro and outro", "cover": "Making the cover and title cards",
     "funnels": "Finding the strongest funnels", "code": "Reading the code", "analysis": "Analyzing for the prospect",
-    "capabilities": "Mapping the backend against the app",
+    "capabilities": "Mapping the backend against the app", "rehearse": "Rehearsing every step (dry run)",
     "music": "Composing the soundtrack", "narration": "Synthesizing narration", "record": "Recording the browser session",
     "review": "Reviewing the footage", "retake": "Retaking a scene", "video": "Assembling demo.mp4",
 }
 STEP_TOOLS = {
     "repos": "github", "scrape": "chromium", "audience": "gemini", "understand": "gemini", "storyboard": "gemini",
     "plancheck": "gemini", "launchpack": "gemini", "ai_clips": "fal", "cover": "fal", "music": "fal", "narration": "fal",
-    "funnels": "gemini", "code": "github", "analysis": "gemini", "capabilities": "github",
+    "funnels": "gemini", "code": "github", "analysis": "gemini", "capabilities": "github", "rehearse": "chromium",
     "record": "chromium", "review": "gemini", "retake": "chromium", "video": "ffmpeg",
 }
 
@@ -214,7 +214,21 @@ def _user_secrets(user_id: Optional[str], req: PipelineRequest, log: Callable[[s
     return (token.decode() if token else None), storage_state
 
 
-async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional[str] = None) -> None:
+def _script_storyboard(script: Dict[str, Any], lines: Optional[List[str]]) -> Storyboard:
+    """A finished job's storyboard as a fresh script: the same pages, steps and narration (a line replaced where
+    `lines` has one), every measured or produced field cleared for the new recording."""
+    storyboard = script["storyboard"].model_copy(deep=True)
+    storyboard.total_duration_sec, storyboard.intro_sec, storyboard.outro_sec = 0.0, 0.0, 0.0
+    storyboard.cover, storyboard.soundtrack = None, None
+    for i, scene in enumerate(storyboard.scenes):
+        scene.duration_sec, scene.video_path, scene.audio_path, scene.verdict, scene.seen = 0.0, None, None, None, None
+        if lines and i < len(lines) and lines[i]:
+            scene.narration = lines[i]
+    return storyboard
+
+
+async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional[str] = None,
+                            script: Optional[Dict[str, Any]] = None) -> None:
     job = JOBS[job_id]
     ledger.bind(job)  # first: every task created from here on inherits the ledger target
     events = EVENTS.get(job_id) or EVENTS.setdefault(job_id, JobEvents())
@@ -254,7 +268,13 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
                 log(f"Staged sample data: {fixture_set['enabled_count']} endpoint(s) for {fixture_set['origin']}"
                     + (" (Gemini-polished)" if fixture_set["polished"] else "") + "; the video is labelled 'Sample data'")
 
-        if req.audience:  # researched beside the ingest; build_audience never raises
+        scripted_brief = (script or {}).get("audience")
+        if script is not None:
+            log(f"Re-recording the script of job {script['from_job']}: the same pages, steps and narration"
+                + (" (some lines replaced)" if req.narration and any(req.narration) else "") + "; no planning")
+        if scripted_brief is not None:
+            step("audience", "done", detail=f"{scripted_brief.company} · reused from job {script['from_job']}")
+        elif req.audience:  # researched beside the ingest; build_audience never raises
             step("audience", "running", detail=audience.running_detail(req.audience))
             audience_task = asyncio.create_task(
                 audience.build_audience(req.audience, req.target_seconds, log, req.app_url))
@@ -316,12 +336,16 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
             brief = await audience_task
             job.audience = brief
             step("audience", "done", detail=audience.step_detail(brief))
+        elif scripted_brief is not None:
+            brief = job.audience = scripted_brief
         job.progress = 20
 
         # 1b. Funnels: Gemini reads the codebase and the live app for the product's strongest paths, beside Understand
         funnels: List[Dict[str, Any]] = []
         funnel_task: Optional[asyncio.Task] = None
-        if feature_on("FUNNELS") and get_secret("GEMINI_API_KEY"):
+        if script is not None:
+            step("funnels", "skipped", detail=f"a frozen script (job {script['from_job']})")
+        elif feature_on("FUNNELS") and get_secret("GEMINI_API_KEY"):
             evidence = len(repo_info.get("routes") or []) + len(repo_info.get("flow_files") or [])
             step("funnels", "running", detail=f"{evidence} routes and flow files in the code, {len(pages) + 1} live pages")
             funnel_task = asyncio.create_task(funnels_mod.find_funnels(repo_info, app_info, project_name(repo_info, app_info),
@@ -332,7 +356,7 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
 
         # 1c. Understand: Gemini looks at the page screenshots once; a failure costs one log line, never the demo
         shots = [p for p in [app_info.get("screenshot"), *(pg.get("screenshot") for pg in pages)] if p]
-        if feature_on("VISION") and get_secret("GEMINI_API_KEY") and shots:
+        if feature_on("VISION") and get_secret("GEMINI_API_KEY") and shots and script is None:
             step("understand", "running", detail=f"{len(shots)} screenshots → Gemini")
             log(f"Gemini is looking at {len(shots)} page screenshots...")
             insights = await _optional(vision.describe_pages(app_info, log), 20, "understand", "Understand")
@@ -364,11 +388,15 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
         cover_tool = "chromium" if product_shots else None
         host = _display_host(app_info)
         title_cards = not req.ai_clips and (brief is not None or feature_on("TITLE_CARDS", default=False))
-        storyboard, note = await generate_storyboard(
-            repo_info, app_info, req.target_seconds, req.voice_style, ", ".join(req.repo_urls),
-            ai_clips=req.ai_clips, audience=brief, title_cards=title_cards, want_music=want_music,
-            want_cover=cover_off is None and not product_shots, funnels=funnels, instructions=req.instructions,
-        )
+        if script is not None:
+            storyboard = _script_storyboard(script, req.narration)
+            note = f"Script from job {script['from_job']}: {len(storyboard.scenes)} scenes as recorded there, no planning"
+        else:
+            storyboard, note = await generate_storyboard(
+                repo_info, app_info, req.target_seconds, req.voice_style, ", ".join(req.repo_urls),
+                ai_clips=req.ai_clips, audience=brief, title_cards=title_cards, want_music=want_music,
+                want_cover=cover_off is None and not product_shots, funnels=funnels, instructions=req.instructions,
+            )
         log(note)
         job.storyboard = storyboard
         scenes = storyboard.scenes
@@ -392,7 +420,7 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
         if not found:
             log(f"Plan check: {len(scenes)} scenes, {verified} actions verified against the inventory, 0 issues")
         else:
-            can_repair = bool(get_secret("GEMINI_API_KEY")) and feature_on("PLANCHECK")
+            can_repair = bool(get_secret("GEMINI_API_KEY")) and feature_on("PLANCHECK") and script is None
             log(f"Plan check: {plancheck.summarize(found)}" + (" → asking Gemini to revise" if can_repair else ""))
             left = found
             if can_repair:
@@ -413,10 +441,15 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
             fixed = plancheck.drop_invalid(storyboard, left, log)  # the deterministic last word
         step("plancheck", "done", detail=plancheck.describe(verified, found, revised, repair_sec, left, fixed, reason))
         step("launchpack", "running")
-        kit_task = asyncio.create_task(
-            generate_launch_kit(storyboard, repo_info, app_info, ", ".join(req.repo_urls), req.app_url, audience=brief,
-                                log=log)
-        )
+        if script is not None and script.get("launch_kit") is not None:
+            async def _reused_kit():
+                return script["launch_kit"].model_copy(deep=True), f"Launch kit reused from job {script['from_job']}"
+            kit_task = asyncio.create_task(_reused_kit())
+        else:
+            kit_task = asyncio.create_task(
+                generate_launch_kit(storyboard, repo_info, app_info, ", ".join(req.repo_urls), req.app_url, audience=brief,
+                                    log=log)
+            )
         # Bookends: "video" = the AI clips (ai_clips); "cards" = typeset title cards on a fal.ai FLUX still (step "cover").
         bookend_mode = "video" if req.ai_clips else "cards" if title_cards else None
         if bookend_mode != "video":
@@ -507,6 +540,17 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
             background.append(music_task)
         job.progress = 35
 
+        # 2c. Dry run: every step performed once without a camera (links followed, buttons and forms only found),
+        # beside the narration; what would fail on camera is dropped before the pacing fit and the recording.
+        rehearse_task: Optional[asyncio.Task] = None
+        if feature_on("REHEARSE"):
+            step("rehearse", "running", detail=f"{sum(len(s.actions) for s in scenes)} steps, no camera")
+            rehearse_task = asyncio.create_task(rehearsal.dry_run(scenes, req.app_url, log, storage_state=storage_state,
+                                                                  replayer=replayer))
+            _TASKS.add(rehearse_task)
+            rehearse_task.add_done_callback(_TASKS.discard)
+            background.append(rehearse_task)
+
         # 3. Narration (all scenes in parallel); durations measured with ffprobe
         job.stage = "recording"
         step("narration", "running", detail=f"{len(scenes)} scenes")
@@ -520,6 +564,14 @@ async def run_pipeline_task(job_id: str, req: PipelineRequest, user_id: Optional
             scene.duration_sec = round(duration, 3)
             log(f"Scene {i + 1}/{len(scenes)}: {duration:.2f}s of narration via {engine}")
         clip_durations = [frame_aligned(duration + SCENE_TAIL_SEC) for duration, _ in narrations]
+        if rehearse_task is not None:
+            rehearsed = await _optional(rehearse_task, rehearsal.REHEARSAL_BUDGET_SEC + 30, "rehearse", "Dry run")
+            if rehearsed is not None:
+                dropped = rehearsal.apply(scenes, rehearsed, log)
+                log("Dry run: " + rehearsal.summary(rehearsed, dropped))
+                step("rehearse", "done", detail=rehearsal.summary(rehearsed, dropped))
+            if replayer is not None and hasattr(replayer, "hits"):
+                replayer.hits = 0  # the recording reports its own sample-data hits
         retimed = fit_dwells(scenes, clip_durations, log)  # dwells re-timed to the measured voice; never raises
         step("narration", "done", detail=f"{sum(d for d, _ in narrations):.1f}s across {len(scenes)} scenes"
              + (f" · {retimed} scene{'' if retimed == 1 else 's'} re-timed to the voice" if retimed else ""))
@@ -919,7 +971,8 @@ def create_analysis_job(req: PipelineRequest, user_id: Optional[str] = None) -> 
     return create_pipeline_job(req, user_id=user_id, kind="analysis")
 
 
-def create_pipeline_job(req: PipelineRequest, user_id: Optional[str] = None, kind: str = "video") -> JobStatus:
+def create_pipeline_job(req: PipelineRequest, user_id: Optional[str] = None, kind: str = "video",
+                        script: Optional[Dict[str, Any]] = None) -> JobStatus:
     job_id = uuid.uuid4().hex[:12]
     options: Dict[str, Any] = {"goals": req.goals, "requestedLanguage": req.language}
     if req.language != "auto":
@@ -934,8 +987,8 @@ def create_pipeline_job(req: PipelineRequest, user_id: Optional[str] = None, kin
     events.emit("job", {"id": job_id, "mode": run_mode()})
     if user_id:
         db.execute("INSERT INTO jobs (id, user_id, created_at) VALUES (?, ?, ?)", (job_id, user_id, job.created_at))
-    runner = run_analysis_task if kind == "analysis" else run_pipeline_task
-    for coro in (runner(job_id, req, user_id), _watch_job(job, events)):
+    work = run_analysis_task(job_id, req, user_id) if kind == "analysis" else run_pipeline_task(job_id, req, user_id, script)
+    for coro in (work, _watch_job(job, events)):
         task = asyncio.create_task(coro)
         _TASKS.add(task)
         task.add_done_callback(_TASKS.discard)

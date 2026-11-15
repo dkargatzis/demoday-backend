@@ -192,7 +192,17 @@ def _job_for(job_id: str, user: Dict) -> JobStatus:
           responses={401: {"model": ErrorDetail},
                      422: {"model": ErrorMessage, "description": "Invalid request (a non-http URL, an unknown goal, ...)"}})
 async def start_pipeline(req: PipelineRequest, user: Dict = Depends(auth.current_user)):
-    job = create_pipeline_job(req, user_id=user["id"])
+    script = None
+    if req.from_job:  # a frozen script: one of the caller's finished videos, re-recorded without planning
+        source = _job_for(req.from_job, user)
+        if source.kind != "video" or source.storyboard is None or not source.storyboard.scenes:
+            raise HTTPException(422, f"Job {req.from_job} has no script to re-record (it is not a finished video)")
+        if req.narration is not None and len(req.narration) != len(source.storyboard.scenes):
+            raise HTTPException(422, f"narration: {len(source.storyboard.scenes)} lines expected, one per scene "
+                                     f"(got {len(req.narration)})")
+        script = {"from_job": source.job_id, "storyboard": source.storyboard, "audience": source.audience,
+                  "launch_kit": source.launch_kit}
+    job = create_pipeline_job(req, user_id=user["id"], script=script)
     return JobStarted(**job.model_dump(), jobId=job.job_id)
 
 
